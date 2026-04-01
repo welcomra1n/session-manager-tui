@@ -628,19 +628,7 @@ func main() {
 		filteredIdx = nil
 		lowerFilter := strings.ToLower(filter)
 
-		now := time.Now()
-		weekAgo := now.AddDate(0, 0, -7)
-
-		type bucket struct {
-			header string
-			items  []int // indices into sessions
-		}
-		buckets := []bucket{
-			{header: "── Recent ──"},
-			{header: "── Last Week ──"},
-			{header: "── Older ──"},
-		}
-
+		var recent, older []int
 		for i, s := range sessions {
 			if lowerFilter != "" {
 				haystack := strings.ToLower(s.ProjectName + " " + s.FirstUserMsg + " " + s.LastUserMsg + " " + s.GitBranch)
@@ -648,28 +636,17 @@ func main() {
 					continue
 				}
 			}
-			age := time.Since(s.ModTime)
-			switch {
-			case age < 24*time.Hour:
-				buckets[0].items = append(buckets[0].items, i)
-			case s.ModTime.After(weekAgo):
-				buckets[1].items = append(buckets[1].items, i)
-			default:
-				buckets[2].items = append(buckets[2].items, i)
+			if time.Since(s.ModTime) < 7*24*time.Hour {
+				recent = append(recent, i)
+			} else {
+				older = append(older, i)
 			}
 		}
 
-		colors := []string{"[#00ff00]", "[#5fafff]", "[#666666]"}
-		for bi, bk := range buckets {
-			if len(bk.items) == 0 {
-				continue
-			}
-			for ii, si := range bk.items {
+		addItems := func(items []int, color string) {
+			for _, si := range items {
 				s := sessions[si]
-				label := fmt.Sprintf("%s(%s) %s[-]", colors[bi], s.ModTime.Format("01/02 15:04"), esc(s.ProjectName))
-				if ii == 0 {
-					label = fmt.Sprintf("[yellow]%s[-]\n%s", bk.header, label)
-				}
+				label := fmt.Sprintf("%s(%s) %s[-]", color, s.ModTime.Format("01/02 15:04"), esc(s.ProjectName))
 				desc := esc(trunc(s.FirstUserMsg, 60))
 				if desc == "" {
 					desc = fmt.Sprintf("%d messages", s.MessageCount)
@@ -678,6 +655,13 @@ func main() {
 				filteredIdx = append(filteredIdx, si)
 			}
 		}
+
+		addItems(recent, "[#00ff00]")
+		if len(recent) > 0 && len(older) > 0 {
+			sessionList.AddItem("[#444444]────────────────────────────────[-]", "", 0, nil)
+			filteredIdx = append(filteredIdx, -1)
+		}
+		addItems(older, "[#666666]")
 		if len(filteredIdx) > 0 {
 			sessionList.SetCurrentItem(0)
 			showSessionInfo(filteredIdx[0])
@@ -698,7 +682,7 @@ func main() {
 	populateList("")
 
 	sessionList.SetChangedFunc(func(idx int, _, _ string, _ rune) {
-		if idx >= 0 && idx < len(filteredIdx) {
+		if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
 			showSessionInfo(filteredIdx[idx])
 		}
 	})
@@ -706,7 +690,7 @@ func main() {
 	// ── Actions ──
 
 	openSession := func(idx int, inTab bool) {
-		if idx < 0 || idx >= len(filteredIdx) {
+		if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
 			return
 		}
 		s := sessions[filteredIdx[idx]]
@@ -724,7 +708,7 @@ func main() {
 
 	requestSummary := func() {
 		idx := sessionList.GetCurrentItem()
-		if idx < 0 || idx >= len(filteredIdx) {
+		if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
 			return
 		}
 		s := sessions[filteredIdx[idx]]
