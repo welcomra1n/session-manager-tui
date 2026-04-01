@@ -1,4 +1,4 @@
-module github.com/bzhai/claude-session-tui
+module github.com/borball/claude-session-manager-tui
 
 go 1.25.0
 
