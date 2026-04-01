@@ -618,7 +618,7 @@ func main() {
 
 	defaultStatus := func() string {
 		return fmt.Sprintf(
-			"[green]%d sessions[-] [gray](%s)[-] | [yellow]Enter[-] tab | [yellow]s[-] split | [yellow]i[-] summary | [yellow]/[-] search | [yellow]r[-] refresh | [yellow]q[-] quit",
+			"[green]%d sessions[-] [gray](%s)[-] | [yellow]Enter[-] resume | [yellow]n[-] new | [yellow]s[-] split | [yellow]i[-] summary | [yellow]/[-] search | [yellow]r[-] refresh | [yellow]q[-] quit",
 			len(sessions), activeBackend,
 		)
 	}
@@ -819,6 +819,19 @@ func main() {
 					return nil
 				case '/':
 					showSearch()
+					return nil
+				case 'n': // New tab
+					home, _ := os.UserHomeDir()
+					shell := os.Getenv("SHELL")
+					if shell == "" {
+						shell = "/bin/sh"
+					}
+					err := openInTerminal(shell, home, true, app)
+					if err != nil {
+						statusBar.SetText(fmt.Sprintf("[red]Failed (%s): %v[-]", activeBackend, err))
+					} else {
+						statusBar.SetText("[green]Opened new tab[-]")
+					}
 					return nil
 				case 's':
 					openSession(sessionList.GetCurrentItem(), false)
