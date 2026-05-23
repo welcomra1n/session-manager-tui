@@ -16,7 +16,36 @@ import (
 	"github.com/rivo/tview"
 )
 
+// ── Constants ───────────────────────────────────────────────────────────────
+
+const sessionExpiryDays = 30 // sessions older than this are considered expired
+
 // ── Data types ──────────────────────────────────────────────────────────────
+
+type Provider int
+
+const (
+	ProviderClaude Provider = iota
+	ProviderCodex
+)
+
+func (p Provider) Icon() string {
+	switch p {
+	case ProviderCodex:
+		return "\xf0\x9f\xa4\x96" // 🤖 (Codex)
+	default:
+		return "\xf0\x9f\xa7\xa0" // 🧠 (Claude)
+	}
+}
+
+func (p Provider) Label() string {
+	switch p {
+	case ProviderCodex:
+		return "Codex"
+	default:
+		return "Claude"
+	}
+}
 
 type Session struct {
 	ID           string
@@ -33,6 +62,12 @@ type Session struct {
 	GitBranch    string
 	CWD          string
 	Messages     []Message
+	Alias        string   // user-defined alias for the session
+	Selected     bool     // multi-select checkbox state
+	Provider     Provider // Claude or Codex
+	Entrypoint   string   // cli, claude-desktop, web, etc.
+	Active       bool     // session is currently open by another process
+	Pinned       bool     // pinned in Codex desktop
 }
 
 type Message struct {
@@ -41,10 +76,121 @@ type Message struct {
 }
 
 type rawLine struct {
-	Type      string          `json:"type"`
-	Message   json.RawMessage `json:"message,omitempty"`
-	GitBranch string          `json:"gitBranch,omitempty"`
-	CWD       string          `json:"cwd,omitempty"`
+	Type       string          `json:"type"`
+	Message    json.RawMessage `json:"message,omitempty"`
+	GitBranch  string          `json:"gitBranch,omitempty"`
+	CWD        string          `json:"cwd,omitempty"`
+	Entrypoint string          `json:"entrypoint,omitempty"`
+}
+
+// ── Korean Dubeolsik → English key mapping ──────────────────────────────────
+
+var korToEng = map[rune]rune{
+	// Jamo (자모)
+	'ㅂ': 'q', 'ㅈ': 'w', 'ㄷ': 'e', 'ㄱ': 'r', 'ㅅ': 't',
+	'ㅛ': 'y', 'ㅕ': 'u', 'ㅑ': 'i', 'ㅐ': 'o', 'ㅔ': 'p',
+	'ㅁ': 'a', 'ㄴ': 's', 'ㅇ': 'd', 'ㄹ': 'f', 'ㅎ': 'g',
+	'ㅗ': 'h', 'ㅓ': 'j', 'ㅏ': 'k', 'ㅣ': 'l',
+	'ㅋ': 'z', 'ㅌ': 'x', 'ㅊ': 'c', 'ㅍ': 'v', 'ㅠ': 'b',
+	'ㅜ': 'n', 'ㅡ': 'm',
+	// Shift variants
+	'ㅃ': 'Q', 'ㅉ': 'W', 'ㄸ': 'E', 'ㄲ': 'R', 'ㅆ': 'T',
+	'ㅒ': 'O', 'ㅖ': 'P',
+}
+
+// korSyllableToEng decomposes a Korean syllable to its initial consonant
+// and maps it to the English key. This handles IME-composed characters.
+func korSyllableToEng(r rune) (rune, bool) {
+	// Direct jamo match
+	if eng, ok := korToEng[r]; ok {
+		return eng, true
+	}
+	// Decompose Korean syllable (가=0xAC00) to initial consonant
+	if r >= 0xAC00 && r <= 0xD7A3 {
+		// Korean syllable block: (initial * 21 + medial) * 28 + final
+		idx := r - 0xAC00
+		initial := idx / (21 * 28)
+		// Initial consonants in order: ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ
+		initials := []rune{'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'}
+		if int(initial) < len(initials) {
+			if eng, ok := korToEng[initials[initial]]; ok {
+				return eng, true
+			}
+		}
+	}
+	return r, false
+}
+
+func toEngKey(r rune) rune {
+	if eng, ok := korSyllableToEng(r); ok {
+		return eng
+	}
+	return r
+}
+
+// padRight pads a string to n visible characters (ignoring tview color tags)
+func padRight(s string, n int) string {
+	// Count visible length (strip tview tags)
+	visible := 0
+	inTag := false
+	for _, r := range s {
+		if r == '[' {
+			inTag = true
+			continue
+		}
+		if inTag {
+			if r == ']' {
+				inTag = false
+			}
+			continue
+		}
+		visible++
+	}
+	if visible >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-visible)
+}
+
+// isSessionActive checks if a session file was modified very recently (likely in use)
+func isSessionActive(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) < 2*time.Minute
+}
+
+func entrypointIcon(ep string) string {
+	switch ep {
+	case "cli":
+		return "CLI"
+	case "claude-desktop":
+		return "DSK"
+	case "web", "claude-ai":
+		return "WEB"
+	default:
+		if ep != "" {
+			return ep
+		}
+		return "  "
+	}
+}
+
+func entrypointLabel(ep string) string {
+	switch ep {
+	case "cli":
+		return "CLI"
+	case "claude-desktop":
+		return "Desktop"
+	case "web", "claude-ai":
+		return "Web"
+	default:
+		if ep != "" {
+			return ep
+		}
+		return ""
+	}
 }
 
 type msgEnvelope struct {
@@ -58,9 +204,6 @@ type contentBlock struct {
 }
 
 // ── Path decoding ───────────────────────────────────────────────────────────
-// Claude Code encodes project paths by replacing '/' with '-'.
-// Since directory names can also contain '-', we walk the filesystem
-// to find the correct path.
 
 func decodePath(enc string) string {
 	if enc == "" {
@@ -105,7 +248,6 @@ func lastSegment(p string) string {
 	return parts[len(parts)-1]
 }
 
-// esc escapes '[' so tview doesn't interpret them as color tags.
 func esc(s string) string { return strings.ReplaceAll(s, "[", "[[]") }
 
 func fmtSize(b int64) string {
@@ -129,7 +271,6 @@ func trunc(s string, n int) string {
 	return s
 }
 
-// isMeaningfulMsg filters out slash commands, system meta messages, and noise.
 func isMeaningfulMsg(s string) bool {
 	if len(s) < 3 {
 		return false
@@ -146,7 +287,7 @@ func isMeaningfulMsg(s string) bool {
 	}
 	if strings.HasPrefix(first, "/") {
 		word := strings.Fields(first)[0]
-		if !strings.Contains(word[1:], "/") { // not a file path
+		if !strings.Contains(word[1:], "/") {
 			return false
 		}
 	}
@@ -192,6 +333,397 @@ func extractText(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// ── Codex session loading ───────────────────────────────────────────────────
+
+type codexIndexEntry struct {
+	ID         string `json:"id"`
+	ThreadName string `json:"thread_name"`
+	UpdatedAt  string `json:"updated_at"`
+	CWD        string `json:"cwd"`
+}
+
+type codexLine struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+type codexPayload struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type codexContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+func extractCodexText(raw json.RawMessage) string {
+	var blocks []codexContentBlock
+	if json.Unmarshal(raw, &blocks) == nil {
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "input_text" || b.Type == "output_text" {
+				if t := strings.TrimSpace(b.Text); t != "" {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func findCodexSessionFile(id string) string {
+	home, _ := os.UserHomeDir()
+	base := filepath.Join(home, ".codex", "sessions")
+	pattern := filepath.Join(base, "**", "rollout-*-"+id+".jsonl")
+	matches, _ := filepath.Glob(pattern)
+	if len(matches) > 0 {
+		return matches[0]
+	}
+	// Walk year/month/day directories
+	years, _ := os.ReadDir(base)
+	for _, y := range years {
+		if !y.IsDir() {
+			continue
+		}
+		months, _ := os.ReadDir(filepath.Join(base, y.Name()))
+		for _, m := range months {
+			if !m.IsDir() {
+				continue
+			}
+			days, _ := os.ReadDir(filepath.Join(base, y.Name(), m.Name()))
+			for _, d := range days {
+				if !d.IsDir() {
+					continue
+				}
+				files, _ := os.ReadDir(filepath.Join(base, y.Name(), m.Name(), d.Name()))
+				for _, f := range files {
+					if strings.Contains(f.Name(), id) {
+						return filepath.Join(base, y.Name(), m.Name(), d.Name(), f.Name())
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func loadCodexSession(entry codexIndexEntry) *Session {
+	sessionFile := findCodexSessionFile(entry.ID)
+	if sessionFile == "" {
+		return nil
+	}
+
+	info, err := os.Stat(sessionFile)
+	if err != nil {
+		return nil
+	}
+
+	cwd := entry.CWD
+	projectName := lastSegment(cwd)
+	if projectName == "" {
+		projectName = "codex"
+	}
+
+	sess := &Session{
+		ID:          entry.ID,
+		ProjectDir:  cwd,
+		ProjectName: projectName,
+		SessionFile: sessionFile,
+		ModTime:     info.ModTime(),
+		FileSize:    info.Size(),
+		CWD:         cwd,
+		Provider:    ProviderCodex,
+	}
+
+	// Use file ModTime (more accurate than index updated_at, which may be stale)
+
+	f, err := os.Open(sessionFile)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 10<<20)
+
+	for sc.Scan() {
+		var line codexLine
+		if json.Unmarshal(sc.Bytes(), &line) != nil {
+			continue
+		}
+		// Read CWD from session_meta
+		if line.Type == "session_meta" && line.Payload != nil {
+			var meta struct {
+				CWD string `json:"cwd"`
+			}
+			if json.Unmarshal(line.Payload, &meta) == nil && meta.CWD != "" {
+				sess.CWD = meta.CWD
+				sess.ProjectDir = meta.CWD
+				sess.ProjectName = lastSegment(meta.CWD)
+			}
+			continue
+		}
+		if line.Type != "response_item" || line.Payload == nil {
+			continue
+		}
+		var payload codexPayload
+		if json.Unmarshal(line.Payload, &payload) != nil {
+			continue
+		}
+		if payload.Role != "user" && payload.Role != "assistant" {
+			continue
+		}
+		text := extractCodexText(payload.Content)
+		if text == "" {
+			continue
+		}
+		// Skip very long system-like messages
+		if len(text) > 2000 {
+			text = text[:2000] + "..."
+		}
+
+		msgType := payload.Role
+		sess.Messages = append(sess.Messages, Message{Type: msgType, Content: text})
+		sess.MessageCount++
+
+		if msgType == "user" {
+			sess.UserMsgCount++
+			c := strings.TrimSpace(text)
+			if len(c) > 3 && !strings.HasPrefix(c, "#") && !strings.HasPrefix(c, "<") {
+				if sess.FirstUserMsg == "" {
+					sess.FirstUserMsg = c
+				}
+				sess.LastUserMsg = c
+			}
+		} else {
+			sess.AsstMsgCount++
+		}
+	}
+
+	// Use thread_name as session title (Codex desktop shows this as session name)
+	if entry.ThreadName != "" {
+		sess.Alias = entry.ThreadName
+		if len(sess.Alias) > 40 {
+			sess.Alias = sess.Alias[:37] + "..."
+		}
+	}
+	if sess.FirstUserMsg == "" && entry.ThreadName != "" {
+		sess.FirstUserMsg = entry.ThreadName
+	}
+
+	if sess.MessageCount == 0 {
+		return nil
+	}
+	return sess
+}
+
+func discoverCodexSessions() []*Session {
+	home, _ := os.UserHomeDir()
+	indexPath := filepath.Join(home, ".codex", "session_index.jsonl")
+
+	f, err := os.Open(indexPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// Deduplicate by ID — keep latest entry only
+	seen := make(map[string]codexIndexEntry)
+	var order []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 10<<20)
+
+	for sc.Scan() {
+		var entry codexIndexEntry
+		if json.Unmarshal(sc.Bytes(), &entry) != nil {
+			continue
+		}
+		if _, exists := seen[entry.ID]; !exists {
+			order = append(order, entry.ID)
+		}
+		seen[entry.ID] = entry // last write wins (latest update)
+	}
+
+	var out []*Session
+	for _, id := range order {
+		entry := seen[id]
+		if s := loadCodexSession(entry); s != nil {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ── Session deletion ────────────────────────────────────────────────────────
+
+func deleteSession(s *Session) error {
+	// Delete the session file
+	if err := os.Remove(s.SessionFile); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	// For Codex sessions, also remove from session_index.jsonl
+	if s.Provider == ProviderCodex {
+		removeFromCodexIndex(s.ID)
+	}
+	return nil
+}
+
+func removeFromCodexIndex(id string) {
+	home, _ := os.UserHomeDir()
+	indexPath := filepath.Join(home, ".codex", "session_index.jsonl")
+
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return
+	}
+
+	var kept []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry codexIndexEntry
+		if json.Unmarshal([]byte(line), &entry) == nil && entry.ID == id {
+			continue // skip this entry
+		}
+		kept = append(kept, line)
+	}
+
+	os.WriteFile(indexPath, []byte(strings.Join(kept, "\n")+"\n"), 0644)
+}
+
+// ── Codex pin detection ─────────────────────────────────────────────────────
+
+func loadCodexPins() map[string]bool {
+	home, _ := os.UserHomeDir()
+	data, err := os.ReadFile(filepath.Join(home, ".codex", ".codex-global-state.json"))
+	if err != nil {
+		return nil
+	}
+	var state map[string]json.RawMessage
+	if json.Unmarshal(data, &state) != nil {
+		return nil
+	}
+	raw, ok := state["pinned-thread-ids"]
+	if !ok {
+		return nil
+	}
+	var ids []string
+	if json.Unmarshal(raw, &ids) != nil {
+		return nil
+	}
+	pins := make(map[string]bool)
+	for _, id := range ids {
+		pins[id] = true
+	}
+	return pins
+}
+
+// ── Pin persistence (local, works for both Claude and Codex) ────────────────
+
+func pinFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "session-pins.json")
+}
+
+func loadPins() map[string]bool {
+	// Load our local pins
+	pins := make(map[string]bool)
+	data, err := os.ReadFile(pinFilePath())
+	if err == nil {
+		var ids []string
+		if json.Unmarshal(data, &ids) == nil {
+			for _, id := range ids {
+				pins[id] = true
+			}
+		}
+	}
+	// Also load Codex desktop pins
+	codexPins := loadCodexPins()
+	for id := range codexPins {
+		pins[id] = true
+	}
+	return pins
+}
+
+func savePins(pins map[string]bool) error {
+	var ids []string
+	for id := range pins {
+		ids = append(ids, id)
+	}
+	data, err := json.MarshalIndent(ids, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pinFilePath(), data, 0644)
+}
+
+// ── Alias persistence ───────────────────────────────────────────────────────
+
+func aliasFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "session-aliases.json")
+}
+
+func loadAliases() map[string]string {
+	data, err := os.ReadFile(aliasFilePath())
+	if err != nil {
+		return make(map[string]string)
+	}
+	var aliases map[string]string
+	if json.Unmarshal(data, &aliases) != nil {
+		return make(map[string]string)
+	}
+	return aliases
+}
+
+func saveAliases(aliases map[string]string) error {
+	data, err := json.MarshalIndent(aliases, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(aliasFilePath(), data, 0644)
+}
+
+// ── Expiry helpers ──────────────────────────────────────────────────────────
+
+func daysUntilExpiry(s *Session) int {
+	expiry := s.ModTime.AddDate(0, 0, sessionExpiryDays)
+	return int(time.Until(expiry).Hours() / 24)
+}
+
+func expiryIcon(s *Session) string {
+	d := daysUntilExpiry(s)
+	switch {
+	case d < 0:
+		return "\xf0\x9f\x92\x80" // 💀 expired
+	case d <= 3:
+		return "\xf0\x9f\x94\xb4" // 🔴 expiring very soon
+	case d <= 7:
+		return "\xf0\x9f\x9f\xa1" // 🟡 expiring soon
+	default:
+		return "\xf0\x9f\x9f\xa2" // 🟢 healthy
+	}
+}
+
+func expiryLabel(s *Session) string {
+	d := daysUntilExpiry(s)
+	if d < 0 {
+		return fmt.Sprintf("D+%d", -d)
+	}
+	if d == 0 {
+		return "D-Day"
+	}
+	return fmt.Sprintf("D-%d", d)
 }
 
 // ── Session loading ─────────────────────────────────────────────────────────
@@ -244,6 +776,9 @@ func loadSession(path string) *Session {
 		if sess.CWD == "" && raw.CWD != "" {
 			sess.CWD = raw.CWD
 		}
+		if sess.Entrypoint == "" && raw.Entrypoint != "" {
+			sess.Entrypoint = raw.Entrypoint
+		}
 
 		if raw.Type == "user" {
 			sess.UserMsgCount++
@@ -259,7 +794,6 @@ func loadSession(path string) *Session {
 		}
 	}
 
-	// Filter out empty sessions and one-shot -p sessions (likely AI summary calls)
 	if sess.MessageCount == 0 || (sess.UserMsgCount <= 1 && sess.AsstMsgCount <= 1) {
 		return nil
 	}
@@ -273,6 +807,7 @@ func discoverSessions() []*Session {
 	if err != nil {
 		return nil
 	}
+	aliases := loadAliases()
 	var out []*Session
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
@@ -286,11 +821,36 @@ func discoverSessions() []*Session {
 		for _, f := range files {
 			if strings.HasSuffix(f.Name(), ".jsonl") {
 				if s := loadSession(filepath.Join(dir, f.Name())); s != nil {
+					if alias, ok := aliases[s.ID]; ok {
+						s.Alias = alias
+					}
 					out = append(out, s)
 				}
 			}
 		}
 	}
+	// Merge Codex sessions
+	codexSessions := discoverCodexSessions()
+	for _, cs := range codexSessions {
+		if alias, ok := aliases[cs.ID]; ok {
+			cs.Alias = alias
+		}
+		out = append(out, cs)
+	}
+
+	// Apply pins (both local and Codex desktop)
+	pins := loadPins()
+	for _, s := range out {
+		if pins[s.ID] {
+			s.Pinned = true
+		}
+	}
+
+	// Detect active sessions
+	for _, s := range out {
+		s.Active = isSessionActive(s.SessionFile)
+	}
+
 	sort.Slice(out, func(i, j int) bool { return out[i].ModTime.After(out[j].ModTime) })
 	return out
 }
@@ -305,11 +865,12 @@ const (
 	backendTmux
 	backendKitty
 	backendWezTerm
+	backendGhostty
 	backendFallback
 )
 
 func (b termBackend) String() string {
-	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "fallback"}
+	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "fallback"}
 	if int(b) < len(names) {
 		return names[b]
 	}
@@ -329,12 +890,11 @@ func detectBackend() termBackend {
 		return backendTerminalApp
 	case "WezTerm":
 		return backendWezTerm
+	case "ghostty":
+		return backendGhostty
 	}
 	if os.Getenv("KITTY_PID") != "" {
 		return backendKitty
-	}
-	if _, err := exec.LookPath("tmux"); err == nil {
-		return backendTmux
 	}
 	return backendFallback
 }
@@ -364,6 +924,8 @@ func openInTerminal(command, dir string, inTab bool, app *tview.Application) err
 		return kittyOpen(command, dir, inTab)
 	case backendWezTerm:
 		return weztermOpen(command, dir, inTab)
+	case backendGhostty:
+		return ghosttyOpen(command, dir, inTab)
 	default:
 		var runErr error
 		app.Suspend(func() {
@@ -402,7 +964,6 @@ func terminalAppOpen(command, dir string, inTab bool) error {
 	cmd := escapeAppleScript(command)
 	d := escapeAppleScript(dir)
 	if inTab {
-		// Open a new tab in the frontmost window
 		return runAppleScript(fmt.Sprintf(`tell application "System Events"
 	tell process "Terminal"
 		keystroke "t" using command down
@@ -413,7 +974,6 @@ tell application "Terminal"
 	do script "cd \"%s\" && %s" in front window
 end tell`, d, cmd))
 	}
-	// Open a new window
 	return runAppleScript(fmt.Sprintf(`tell application "Terminal"
 	activate
 	do script "cd \"%s\" && %s"
@@ -451,6 +1011,15 @@ func weztermOpen(command, dir string, inTab bool) error {
 		return exec.Command("wezterm", "cli", "spawn", "--cwd", dir, "--", shell, "-c", fullCmd).Run()
 	}
 	return exec.Command("wezterm", "cli", "split-pane", "--right", "--cwd", dir, "--", shell, "-c", fullCmd).Run()
+}
+
+func ghosttyOpen(command, dir string, inTab bool) error {
+	fullCmd := fmt.Sprintf("cd '%s' && exec %s", escapeShell(dir), command)
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	return exec.Command("open", "-na", "Ghostty", "--args", "-e", shell, "-c", fullCmd).Run()
 }
 
 // ── AI Summary ──────────────────────────────────────────────────────────────
@@ -498,21 +1067,24 @@ func generateSummary(s *Session) (string, error) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
-	fmt.Print("Loading sessions...")
+	fmt.Print("세션 불러오는 중...")
 	sessions := discoverSessions()
 	fmt.Print("\r\033[2K")
 
 	activeBackend = detectBackend()
 	app := tview.NewApplication()
 	summaryCache := make(map[string]string)
+	aliases := loadAliases()
+	localPins := loadPins()
 
 	// ── Widgets ──
 
 	sessionList := tview.NewList().
-		ShowSecondaryText(true).
-		SetHighlightFullLine(true)
+		ShowSecondaryText(false).
+		SetHighlightFullLine(true).
+		SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorDarkSlateGray).Foreground(tcell.ColorWhite))
 	sessionList.SetBorder(true).
-		SetTitle(" Sessions ").
+		SetTitle(" 세션 목록 ").
 		SetTitleAlign(tview.AlignLeft).
 		SetBorderColor(tcell.ColorGreen)
 
@@ -521,7 +1093,7 @@ func main() {
 		SetWordWrap(true).
 		SetScrollable(true)
 	infoView.SetBorder(true).
-		SetTitle(" Session Info ").
+		SetTitle(" 세션 정보 ").
 		SetTitleAlign(tview.AlignLeft).
 		SetBorderColor(tcell.ColorDodgerBlue)
 
@@ -530,7 +1102,7 @@ func main() {
 		SetWordWrap(true).
 		SetScrollable(true)
 	convView.SetBorder(true).
-		SetTitle(" Conversation Preview ").
+		SetTitle(" 대화 미리보기 ").
 		SetTitleAlign(tview.AlignLeft).
 		SetBorderColor(tcell.ColorDodgerBlue)
 
@@ -540,11 +1112,16 @@ func main() {
 		SetFieldBackgroundColor(tcell.ColorDefault).
 		SetFieldTextColor(tcell.ColorWhite)
 
+	helpBar := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]Space[-] 선택 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]D[-] 일괄삭제\n[yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
 
-	// ── Layout: left (session list) | right (info + conversation) ──
+	// ── Layout ──
 
 	leftPane := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(sessionList, 0, 1, true)
@@ -554,12 +1131,17 @@ func main() {
 		AddItem(convView, 0, 3, false)
 
 	mainBody := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(leftPane, 0, 2, true).
-		AddItem(rightPane, 0, 5, false)
+		AddItem(leftPane, 0, 1, true)
 
 	mainLayout := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(mainBody, 0, 1, true).
+		AddItem(helpBar, 2, 0, false).
 		AddItem(statusBar, 1, 0, false)
+
+	previewOpen := false
+	var togglePreview func()
+	var filteredIdx []int
+	currentFilter := ""
 
 	// ── Session display ──
 
@@ -570,28 +1152,47 @@ func main() {
 		s := sessions[idx]
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "[yellow]Project:[-]     %s\n", esc(s.ProjectName))
-		fmt.Fprintf(&b, "[yellow]Path:[-]        %s\n", esc(s.ProjectDir))
-		fmt.Fprintf(&b, "[yellow]Session:[-]     [green]%s[-]\n", s.ID)
-		fmt.Fprintf(&b, "[yellow]Modified:[-]    %s\n", s.ModTime.Format("2006-01-02 15:04:05"))
-		fmt.Fprintf(&b, "[yellow]Size:[-]        %s\n", fmtSize(s.FileSize))
-		fmt.Fprintf(&b, "[yellow]Messages:[-]    %d (%d user, %d asst)\n", s.MessageCount, s.UserMsgCount, s.AsstMsgCount)
+		epInfo := entrypointLabel(s.Entrypoint)
+		if s.Provider == ProviderCodex {
+			epInfo = "Desktop"
+		}
+		if epInfo != "" {
+			fmt.Fprintf(&b, "[yellow]제공자:[-]    %s %s (%s)\n", s.Provider.Icon(), s.Provider.Label(), epInfo)
+		} else {
+			fmt.Fprintf(&b, "[yellow]제공자:[-]    %s %s\n", s.Provider.Icon(), s.Provider.Label())
+		}
+		if s.Active {
+			fmt.Fprintf(&b, "[yellow]상태:[-]        [lime]▶ 활성[-]\n")
+		}
+		if s.Pinned {
+			fmt.Fprintf(&b, "[yellow]고정:[-]        \xf0\x9f\x93\x8c 고정됨\n")
+		}
+		fmt.Fprintf(&b, "[yellow]프로젝트:[-]     %s\n", esc(s.ProjectName))
+		if s.Alias != "" {
+			fmt.Fprintf(&b, "[yellow]별칭:[-]       [aqua]%s[-]\n", esc(s.Alias))
+		}
+		fmt.Fprintf(&b, "[yellow]경로:[-]        %s\n", esc(s.ProjectDir))
+		fmt.Fprintf(&b, "[yellow]세션:[-]     [green]%s[-]\n", s.ID)
+		fmt.Fprintf(&b, "[yellow]수정일:[-]    %s\n", s.ModTime.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(&b, "[yellow]만료:[-]      %s %s\n", expiryIcon(s), expiryLabel(s))
+		fmt.Fprintf(&b, "[yellow]크기:[-]        %s\n", fmtSize(s.FileSize))
+		fmt.Fprintf(&b, "[yellow]메시지:[-]    %d (%d 사용자, %d 어시스턴트)\n", s.MessageCount, s.UserMsgCount, s.AsstMsgCount)
 		if s.GitBranch != "" {
-			fmt.Fprintf(&b, "[yellow]Git Branch:[-]  %s\n", esc(s.GitBranch))
+			fmt.Fprintf(&b, "[yellow]브랜치:[-]  %s\n", esc(s.GitBranch))
 		}
 		if s.CWD != "" {
-			fmt.Fprintf(&b, "[yellow]CWD:[-]         %s\n", esc(s.CWD))
+			fmt.Fprintf(&b, "[yellow]작업경로:[-]         %s\n", esc(s.CWD))
 		}
 		if s.FirstUserMsg != "" {
-			fmt.Fprintf(&b, "\n[yellow]First msg:[-]\n  %s\n", esc(trunc(s.FirstUserMsg, 200)))
+			fmt.Fprintf(&b, "\n[yellow]첫 메시지:[-]\n  %s\n", esc(trunc(s.FirstUserMsg, 200)))
 		}
 		if s.LastUserMsg != "" && s.LastUserMsg != s.FirstUserMsg {
-			fmt.Fprintf(&b, "\n[yellow]Last msg:[-]\n  %s\n", esc(trunc(s.LastUserMsg, 200)))
+			fmt.Fprintf(&b, "\n[yellow]마지막 메시지:[-]\n  %s\n", esc(trunc(s.LastUserMsg, 200)))
 		}
 		if summary, ok := summaryCache[s.ID]; ok {
-			fmt.Fprintf(&b, "\n[aqua]── AI Summary ──[-]\n%s\n", esc(summary))
+			fmt.Fprintf(&b, "\n[aqua]── AI 요약 ──[-]\n%s\n", esc(summary))
 		} else {
-			fmt.Fprintf(&b, "\n[gray]Press [yellow]i[-][gray] to generate AI summary[-]\n")
+			fmt.Fprintf(&b, "\n[gray][yellow]i[-][gray] 키를 눌러 AI 요약 생성[-]\n")
 		}
 		infoView.SetText(b.String())
 		infoView.ScrollToBeginning()
@@ -603,23 +1204,46 @@ func main() {
 				content = content[:497] + "..."
 			}
 			if msg.Type == "user" {
-				conv.WriteString(fmt.Sprintf("[green]>>> User:[-]\n%s\n\n", esc(content)))
+				conv.WriteString(fmt.Sprintf("[green]>>> 사용자:[-]\n%s\n\n", esc(content)))
 			} else {
-				conv.WriteString(fmt.Sprintf("[cyan]<<< Assistant:[-]\n%s\n\n", esc(content)))
+				conv.WriteString(fmt.Sprintf("[cyan]<<< 어시스턴트:[-]\n%s\n\n", esc(content)))
 			}
 		}
 		convView.SetText(conv.String())
 		convView.ScrollToBeginning()
 	}
 
+	togglePreview = func() {
+		if previewOpen {
+			mainBody.RemoveItem(rightPane)
+			previewOpen = false
+			app.SetFocus(sessionList)
+		} else {
+			mainBody.AddItem(rightPane, 0, 1, false)
+			previewOpen = true
+			idx := sessionList.GetCurrentItem()
+			if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
+				showSessionInfo(filteredIdx[idx])
+			}
+		}
+	}
+
 	// ── Filtered session list ──
 
-	var filteredIdx []int
-
 	defaultStatus := func() string {
+		selected := 0
+		for _, s := range sessions {
+			if s.Selected {
+				selected++
+			}
+		}
+		sel := ""
+		if selected > 0 {
+			sel = fmt.Sprintf(" | [red]%d개 선택됨[-]", selected)
+		}
 		return fmt.Sprintf(
-			"[green]%d sessions[-] [gray](%s)[-] | [yellow]Enter[-] resume | [yellow]n[-] new | [yellow]s[-] split | [yellow]i[-] summary | [yellow]/[-] search | [yellow]r[-] refresh | [yellow]q[-] quit",
-			len(sessions), activeBackend,
+			"[green]%d개 세션[-] [gray](%s)[-]%s",
+			len(sessions), activeBackend, sel,
 		)
 	}
 
@@ -628,53 +1252,145 @@ func main() {
 		filteredIdx = nil
 		lowerFilter := strings.ToLower(filter)
 
-		var recent, older []int
+		var claudeSessions, codexSessions []int
 		for i, s := range sessions {
 			if lowerFilter != "" {
-				haystack := strings.ToLower(s.ProjectName + " " + s.FirstUserMsg + " " + s.LastUserMsg + " " + s.GitBranch)
+				haystack := strings.ToLower(s.ProjectName + " " + s.Alias + " " + s.FirstUserMsg + " " + s.LastUserMsg + " " + s.GitBranch)
 				if !strings.Contains(haystack, lowerFilter) {
 					continue
 				}
 			}
-			if time.Since(s.ModTime) < 7*24*time.Hour {
-				recent = append(recent, i)
+			if s.Provider == ProviderCodex {
+				codexSessions = append(codexSessions, i)
 			} else {
-				older = append(older, i)
+				claudeSessions = append(claudeSessions, i)
 			}
 		}
 
-		addItems := func(items []int, color string) {
-			for _, si := range items {
-				s := sessions[si]
-				label := fmt.Sprintf("%s(%s) %s[-]", color, s.ModTime.Format("01/02 15:04"), esc(s.ProjectName))
-				desc := esc(trunc(s.FirstUserMsg, 60))
-				if desc == "" {
-					desc = fmt.Sprintf("%d messages", s.MessageCount)
-				}
-				sessionList.AddItem(label, "  [#aaaaaa]"+desc+"[-]", 0, nil)
-				filteredIdx = append(filteredIdx, si)
-			}
-		}
 
-		addItems(recent, "[#00ff00]")
-		if len(recent) > 0 && len(older) > 0 {
-			sessionList.AddItem("[#444444]────────────────────────────────[-]", "", 0, nil)
+		addSeparator := func(title string) {
+			sessionList.AddItem(fmt.Sprintf("[#444444]── %s ──[-]", title), "", 0, nil)
 			filteredIdx = append(filteredIdx, -1)
 		}
-		addItems(older, "[#666666]")
+
+		// Tree item with prefix
+		addTreeItem := func(si int, isLast bool) {
+			s := sessions[si]
+			check := ""
+			if s.Selected {
+				check = "\xe2\x9c\x93" // ✓
+			}
+			title := s.Alias
+			if title == "" {
+				title = trunc(s.FirstUserMsg, 40)
+			}
+			if title == "" {
+				title = fmt.Sprintf("%d개 메시지", s.MessageCount)
+			}
+			provColor := "[#FF8C00]"
+			if s.Provider == ProviderCodex {
+				provColor = "[#4A9EFF]"
+			}
+			epIco := entrypointIcon(s.Entrypoint)
+			if s.Provider == ProviderCodex {
+				epIco = "DSK"
+			}
+			dateColor := "[#666666]"
+			if daysUntilExpiry(s) < 0 {
+				dateColor = "[#FF4444]"
+			} else if time.Since(s.ModTime) < 2*time.Minute {
+				dateColor = "[#00BFFF]"
+			} else if time.Since(s.ModTime) < 7*24*time.Hour {
+				dateColor = "[#00ff00]"
+			}
+			provIcon := s.Provider.Icon()
+			if s.Active {
+				provIcon = "\xe2\x96\xb6"
+			}
+			pinTag := " "
+			if s.Pinned {
+				pinTag = "\xf0\x9f\x93\x8c"
+			}
+
+			branch := "[#444444]\xe2\x94\x9c[-]" // ├
+			if isLast {
+				branch = "[#444444]\xe2\x94\x94[-]" // └
+			}
+
+			col1 := fmt.Sprintf("%s%s%s[-]%s", check, provColor, provIcon, pinTag)
+			col2 := fmt.Sprintf("%-4s", epIco)
+			col3 := padRight(expiryLabel(s), 7)
+			col4 := fmt.Sprintf("%s%-12s[-]", dateColor, s.ModTime.Format("01/02 15:04"))
+			col5 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(s.ProjectName)), 15)
+			col6 := fmt.Sprintf("[white]%s[-]", esc(title))
+			label := fmt.Sprintf("   %s %s %s%s %s %s %s", branch, col1, col2, col3, col4, col5, col6)
+			sessionList.AddItem(label, "", 0, nil)
+			filteredIdx = append(filteredIdx, si)
+		}
+
+		addTreeItems := func(items []int) {
+			for i, si := range items {
+				addTreeItem(si, i == len(items)-1)
+			}
+		}
+
+		// Split each provider into pinned and unpinned
+		addProviderGroup := func(provName string, provColor string, icon string, items []int, newIdx int) {
+			if len(items) == 0 {
+				return
+			}
+			var pinned, normal []int
+			for _, si := range items {
+				if sessions[si].Pinned {
+					pinned = append(pinned, si)
+				} else {
+					normal = append(normal, si)
+				}
+			}
+
+			// Provider header
+			addSeparator(fmt.Sprintf("%s%s %s[-][#444444] (%d)", provColor, icon, provName, len(items)))
+
+			// New session
+			sessionList.AddItem(fmt.Sprintf("   %s+ 새 %s 세션[-]", provColor, provName), "", 0, nil)
+			filteredIdx = append(filteredIdx, newIdx)
+
+			// Pinned
+			if len(pinned) > 0 {
+				sessionList.AddItem("   [#444444]\xf0\x9f\x93\x8c 고정[-]", "", 0, nil)
+				filteredIdx = append(filteredIdx, -1)
+				addTreeItems(pinned)
+			}
+
+			// Normal
+			if len(normal) > 0 {
+				sessionList.AddItem("   [#444444]세션[-]", "", 0, nil)
+				filteredIdx = append(filteredIdx, -1)
+				addTreeItems(normal)
+			}
+		}
+
+		addProviderGroup("Claude", "[#FF8C00]", "\xf0\x9f\xa7\xa0", claudeSessions, -2)
+
+		if len(claudeSessions) > 0 && len(codexSessions) > 0 {
+			sessionList.AddItem("", "", 0, nil)
+			filteredIdx = append(filteredIdx, -1)
+		}
+
+		addProviderGroup("Codex", "[#4A9EFF]", "\xf0\x9f\xa4\x96", codexSessions, -3)
 		if len(filteredIdx) > 0 {
 			sessionList.SetCurrentItem(0)
 			showSessionInfo(filteredIdx[0])
 		}
 		if len(filteredIdx) == 0 {
-			infoView.SetText("[gray]No matching sessions[-]")
+			infoView.SetText("[gray]검색 결과 없음[-]")
 			convView.SetText("")
 		}
 		if filter == "" {
 			statusBar.SetText(defaultStatus())
 		} else {
 			statusBar.SetText(fmt.Sprintf(
-				"[green]%d/%d sessions[-] | [yellow]Esc[-] clear | [yellow]Enter[-] tab | [yellow]s[-] split | [yellow]i[-] summary",
+				"[green]%d/%d개 세션[-] | [yellow]Esc[-] 취소 | [yellow]Enter[-] 열기 | [yellow]i[-] 요약",
 				len(filteredIdx), len(sessions),
 			))
 		}
@@ -682,27 +1398,99 @@ func main() {
 	populateList("")
 
 	sessionList.SetChangedFunc(func(idx int, _, _ string, _ rune) {
-		if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
+		if previewOpen && idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
 			showSessionInfo(filteredIdx[idx])
 		}
 	})
 
 	// ── Actions ──
 
+	newSession := func(provider Provider) {
+		home, _ := os.UserHomeDir()
+		var cmd, label string
+		if provider == ProviderCodex {
+			cmd = "codex --sandbox danger-full-access"
+			label = "Codex"
+		} else {
+			cmd = "claude --dangerously-skip-permissions"
+			label = "Claude"
+		}
+		err := openInTerminal(cmd, home, true, app)
+		if err != nil {
+			statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
+		} else {
+			statusBar.SetText(fmt.Sprintf("[green]새 %s 세션[-]", label))
+			go func() {
+				time.Sleep(2 * time.Second)
+				fresh := discoverSessions()
+				app.QueueUpdateDraw(func() {
+					sessions = fresh
+					aliases = loadAliases()
+					populateList(currentFilter)
+				})
+			}()
+		}
+	}
+
 	openSession := func(idx int, inTab bool) {
-		if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+		if idx < 0 || idx >= len(filteredIdx) {
+			return
+		}
+		fi := filteredIdx[idx]
+		// Handle "New Session" items
+		if fi == -2 {
+			newSession(ProviderClaude)
+			return
+		}
+		if fi == -3 {
+			newSession(ProviderCodex)
+			return
+		}
+		if fi < 0 {
 			return
 		}
 		s := sessions[filteredIdx[idx]]
-		err := openInTerminal(fmt.Sprintf("claude --resume %s", s.ID), s.ProjectDir, inTab, app)
+		var resumeCmd string
+		if s.Provider == ProviderCodex {
+			resumeCmd = fmt.Sprintf("codex resume %s --sandbox danger-full-access", s.ID)
+		} else {
+			resumeCmd = fmt.Sprintf("claude --resume %s --dangerously-skip-permissions", s.ID)
+		}
+		dir := s.ProjectDir
+		if _, statErr := os.Stat(dir); statErr != nil {
+			if s.CWD != "" {
+				dir = s.CWD
+			}
+			if _, statErr := os.Stat(dir); statErr != nil {
+				dir, _ = os.UserHomeDir()
+			}
+		}
+		err := openInTerminal(resumeCmd, dir, inTab, app)
 		if err != nil {
-			statusBar.SetText(fmt.Sprintf("[red]Failed (%s): %v[-]", activeBackend, err))
+			statusBar.SetText(fmt.Sprintf("[red]실패 (%s): %v[-]", activeBackend, err))
 		} else {
 			mode := "tab"
 			if !inTab {
 				mode = "split"
 			}
-			statusBar.SetText(fmt.Sprintf("[green]Opened %s in %s %s[-]", esc(s.ProjectName), activeBackend, mode))
+			statusBar.SetText(fmt.Sprintf("[green]%s 열림 (%s %s)[-]", esc(s.ProjectName), activeBackend, mode))
+			// Auto-refresh after opening so the resumed session moves to top
+			doRefresh := func() {
+				fresh := discoverSessions()
+				app.QueueUpdateDraw(func() {
+					sessions = fresh
+					aliases = loadAliases()
+					populateList(currentFilter)
+				})
+			}
+			go func() {
+				time.Sleep(2 * time.Second)
+				doRefresh()
+				time.Sleep(5 * time.Second)
+				doRefresh()
+				time.Sleep(10 * time.Second)
+				doRefresh()
+			}()
 		}
 	}
 
@@ -718,13 +1506,13 @@ func main() {
 		}
 		sessionID := s.ID
 		sessionIdx := filteredIdx[idx]
-		statusBar.SetText(fmt.Sprintf("[yellow]Generating summary for %s...[-]", esc(s.ProjectName)))
-		infoView.SetText(infoView.GetText(false) + "\n[yellow]Generating AI summary...[-]")
+		statusBar.SetText(fmt.Sprintf("[yellow]%s 요약 생성 중...[-]", esc(s.ProjectName)))
+		infoView.SetText(infoView.GetText(false) + "\n[yellow]AI 요약 생성 중...[-]")
 		go func() {
 			summary, err := generateSummary(s)
 			app.QueueUpdateDraw(func() {
 				if err != nil {
-					statusBar.SetText(fmt.Sprintf("[red]Summary failed: %v[-]", err))
+					statusBar.SetText(fmt.Sprintf("[red]요약 실패: %v[-]", err))
 					return
 				}
 				summaryCache[sessionID] = summary
@@ -732,7 +1520,7 @@ func main() {
 				if curIdx >= 0 && curIdx < len(filteredIdx) && filteredIdx[curIdx] == sessionIdx {
 					showSessionInfo(sessionIdx)
 				}
-				statusBar.SetText(fmt.Sprintf("[green]Summary ready: %s[-]", esc(s.ProjectName)))
+				statusBar.SetText(fmt.Sprintf("[green]요약 완료: %s[-]", esc(s.ProjectName)))
 			})
 		}()
 	}
@@ -746,7 +1534,6 @@ func main() {
 	focusables := []tview.Primitive{sessionList, convView}
 	focusIdx := 0
 	searching := false
-	currentFilter := ""
 
 	updateBorders := func() {
 		if focusIdx == 0 {
@@ -796,66 +1583,301 @@ func main() {
 	// ── Key bindings ──
 
 	app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		if searching && app.GetFocus() == searchInput {
+		// Skip key mapping when typing in any input field
+		if _, ok := app.GetFocus().(*tview.InputField); ok {
 			return ev
 		}
 
 		switch ev.Key() {
 		case tcell.KeyTab:
-			focusIdx = (focusIdx + 1) % len(focusables)
-			app.SetFocus(focusables[focusIdx])
-			updateBorders()
+			if previewOpen {
+				focusIdx = (focusIdx + 1) % len(focusables)
+				app.SetFocus(focusables[focusIdx])
+				updateBorders()
+			}
 			return nil
 		case tcell.KeyEscape:
 			if searching {
 				hideSearch()
 				return nil
 			}
+			if previewOpen {
+				togglePreview()
+				return nil
+			}
+			app.Stop()
+			return nil
 		case tcell.KeyRune:
 			if focusIdx == 0 {
-				switch ev.Rune() {
+				switch toEngKey(ev.Rune()) {
 				case 'q':
 					app.Stop()
 					return nil
+
 				case '/':
 					showSearch()
 					return nil
-				case 'n': // New tab
-					home, _ := os.UserHomeDir()
-					shell := os.Getenv("SHELL")
-					if shell == "" {
-						shell = "/bin/sh"
-					}
-					err := openInTerminal(shell, home, true, app)
-					if err != nil {
-						statusBar.SetText(fmt.Sprintf("[red]Failed (%s): %v[-]", activeBackend, err))
-					} else {
-						statusBar.SetText("[green]Opened new tab[-]")
-					}
+
+				case '?': // Help
+					helpText := tview.NewTextView().
+						SetDynamicColors(true).
+						SetTextAlign(tview.AlignLeft).
+						SetWordWrap(false)
+					helpText.SetText(
+						"[yellow]세션 매니저 도움말[-]\n\n" +
+							"[white]날짜 색상:[-]\n" +
+							"  [#00BFFF]파랑[-]   최근 2분 (활성)\n" +
+							"  [#00ff00]초록[-]   최근 7일\n" +
+							"  [#666666]회색[-]   7일 이상\n" +
+							"  [#FF4444]빨강[-]   만료 (30일+)\n\n" +
+							"[white]아이콘:[-]\n" +
+							"  [#FF8C00]\xe2\x9c\xb4[-]  Claude 세션\n" +
+							"  [#4A9EFF]\xe2\x9c\xa6[-]  Codex 세션\n" +
+							"  \xe2\x96\xb6  활성 (사용 중)\n\n" +
+							"[white]열 구성:[-]  아이콘 | CLI/DSK/WEB | D-day | 날짜 | 프로젝트 | 제목\n\n" +
+							"[white]D-day:[-]  세션 만료까지 남은 일수 (기준 30일)\n" +
+							"  D-29 = 29일 남음  |  D+3 = 3일 전 만료\n\n" +
+							"[white]단축키:[-]\n" +
+							"  Enter=열기    p=미리보기   Space=선택   m=이름변경\n" +
+							"  d=삭제       D=일괄삭제   o=폴더      /=검색\n" +
+							"  r=새로고침   Esc=종료     ?=도움말\n\n" +
+							"[gray]아무 키나 누르면 닫힘[-]",
+					)
+					helpText.SetBorder(true).
+						SetTitle(" 도움말 ").
+						SetTitleAlign(tview.AlignCenter).
+						SetBorderColor(tcell.ColorDodgerBlue).
+						SetBackgroundColor(tcell.ColorDarkSlateGray)
+					helpText.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						app.SetRoot(mainLayout, true)
+						app.SetFocus(sessionList)
+						return nil
+					})
+					helpPage := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(nil, 0, 1, false).
+						AddItem(tview.NewFlex().
+							AddItem(nil, 0, 1, false).
+							AddItem(helpText, 65, 0, true).
+							AddItem(nil, 0, 1, false), 22, 0, true).
+						AddItem(nil, 0, 1, false)
+					pages := tview.NewPages().
+						AddPage("main", mainLayout, true, true).
+						AddPage("help", helpPage, true, true)
+					app.SetRoot(pages, true)
+					app.SetFocus(helpText)
 					return nil
-				case 's':
-					openSession(sessionList.GetCurrentItem(), false)
-					return nil
+
+
+
 				case 'i':
 					requestSummary()
 					return nil
-				case 'r':
+
+				case 'p': // Toggle preview panel
+					togglePreview()
+					return nil
+
+				case 't': // Toggle pin
+					idx := sessionList.GetCurrentItem()
+					if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
+						s := sessions[filteredIdx[idx]]
+						if s.Pinned {
+							s.Pinned = false
+							delete(localPins, s.ID)
+							statusBar.SetText(fmt.Sprintf("[yellow]고정 해제: %s[-]", esc(s.ProjectName)))
+						} else {
+							s.Pinned = true
+							localPins[s.ID] = true
+							statusBar.SetText(fmt.Sprintf("[green]📌 고정: %s[-]", esc(s.ProjectName)))
+						}
+						savePins(localPins)
+						sessions = discoverSessions()
+						populateList(currentFilter)
+					}
+					return nil
+
+				case 'r': // Refresh
 					go func() {
 						app.QueueUpdateDraw(func() {
-							statusBar.SetText("[yellow]Refreshing...[-]")
+							statusBar.SetText("[yellow]새로고침 중...[-]")
 						})
 						fresh := discoverSessions()
 						app.QueueUpdateDraw(func() {
 							sessions = fresh
+							aliases = loadAliases()
 							populateList(currentFilter)
 						})
 					}()
+					return nil
+
+				case ' ': // Toggle multi-select
+					idx := sessionList.GetCurrentItem()
+					if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
+						s := sessions[filteredIdx[idx]]
+						s.Selected = !s.Selected
+						populateList(currentFilter)
+						sessionList.SetCurrentItem(idx)
+						showSessionInfo(filteredIdx[idx])
+					}
+					return nil
+
+				case 'm': // Rename (alias)
+					idx := sessionList.GetCurrentItem()
+					if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+						return nil
+					}
+					s := sessions[filteredIdx[idx]]
+					renameInput := tview.NewInputField().
+						SetLabel(" 새 이름: ").
+						SetText(s.Alias).
+						SetFieldWidth(40).
+						SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
+					renameInput.SetBorder(true).
+						SetTitle(" 세션 이름 변경 ").
+						SetTitleAlign(tview.AlignCenter)
+					renameInput.SetDoneFunc(func(key tcell.Key) {
+						if key == tcell.KeyEnter {
+							newAlias := strings.TrimSpace(renameInput.GetText())
+							s.Alias = newAlias
+							if newAlias == "" {
+								delete(aliases, s.ID)
+							} else {
+								aliases[s.ID] = newAlias
+							}
+							saveAliases(aliases)
+							sessions = discoverSessions()
+							populateList(currentFilter)
+							if newAlias != "" {
+								statusBar.SetText(fmt.Sprintf("[green]이름 변경: %s[-]", esc(newAlias)))
+							} else {
+								statusBar.SetText("[green]별칭 삭제됨[-]")
+							}
+						}
+						app.SetRoot(mainLayout, true)
+						app.SetFocus(sessionList)
+					})
+					modal := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(nil, 0, 1, false).
+						AddItem(tview.NewFlex().
+							AddItem(nil, 0, 1, false).
+							AddItem(renameInput, 50, 0, true).
+							AddItem(nil, 0, 1, false), 3, 0, true).
+						AddItem(nil, 0, 1, false)
+					pages := tview.NewPages().
+						AddPage("main", mainLayout, true, true).
+						AddPage("rename", modal, true, true)
+					app.SetRoot(pages, true)
+					app.SetFocus(renameInput)
+					return nil
+
+				case 'd': // Delete single session
+					idx := sessionList.GetCurrentItem()
+					if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+						return nil
+					}
+					s := sessions[filteredIdx[idx]]
+					displayName := s.ProjectName
+					if s.Alias != "" {
+						displayName = s.Alias
+					}
+					confirmModal := tview.NewModal().
+						SetText(fmt.Sprintf("세션을 삭제하시겠습니까?\n\n%s\n%s", displayName, s.ID)).
+						AddButtons([]string{"삭제", "취소"}).
+						SetDoneFunc(func(_ int, label string) {
+							if label == "삭제" {
+								if err := deleteSession(s); err != nil {
+									statusBar.SetText(fmt.Sprintf("[red]삭제 실패: %v[-]", err))
+								} else {
+									delete(aliases, s.ID)
+									saveAliases(aliases)
+									sessions = discoverSessions()
+									populateList(currentFilter)
+									statusBar.SetText(fmt.Sprintf("[green]삭제됨: %s[-]", esc(displayName)))
+								}
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(sessionList)
+						})
+					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+					confirmModal.SetButtonBackgroundColor(tcell.ColorDimGray)
+					confirmModal.SetButtonTextColor(tcell.ColorWhite)
+					confirmModal.SetFocus(0) // focus on Delete button
+					// Style: focused button = bright, unfocused = dim
+					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite))
+					app.SetRoot(confirmModal, true)
+					return nil
+
+				case 'D': // Delete all selected sessions
+					var selected []*Session
+					for _, s := range sessions {
+						if s.Selected {
+							selected = append(selected, s)
+						}
+					}
+					if len(selected) == 0 {
+						statusBar.SetText("[yellow]선택된 세션 없음. Space로 선택하세요.[-]")
+						return nil
+					}
+					confirmModal := tview.NewModal().
+						SetText(fmt.Sprintf("%d개 세션을 삭제하시겠습니까?", len(selected))).
+						AddButtons([]string{"전체 삭제", "취소"}).
+						SetDoneFunc(func(_ int, label string) {
+							if label == "전체 삭제" {
+								deleted := 0
+								for _, s := range selected {
+									if deleteSession(s) == nil {
+										delete(aliases, s.ID)
+										deleted++
+									}
+								}
+								saveAliases(aliases)
+								sessions = discoverSessions()
+								populateList(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(sessionList)
+						})
+					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+					confirmModal.SetButtonTextColor(tcell.ColorGray)
+					confirmModal.SetFocus(0)
+					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+					app.SetRoot(confirmModal, true)
+					return nil
+
+				case 'o': // Open session folder in Finder
+					idx := sessionList.GetCurrentItem()
+					if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+						return nil
+					}
+					s := sessions[filteredIdx[idx]]
+					dir := filepath.Dir(s.SessionFile)
+					if err := exec.Command("open", dir).Run(); err != nil {
+						statusBar.SetText(fmt.Sprintf("[red]폴더 열기 실패: %v[-]", err))
+					} else {
+						statusBar.SetText(fmt.Sprintf("[green]폴더 열림: %s[-]", esc(dir)))
+					}
 					return nil
 				}
 			}
 		}
 		return ev
 	})
+
+	// Background polling: auto-refresh every 10 seconds
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			fresh := discoverSessions()
+			app.QueueUpdateDraw(func() {
+				sessions = fresh
+				aliases = loadAliases()
+				populateList(currentFilter)
+			})
+		}
+	}()
 
 	if err := app.SetRoot(mainLayout, true).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
