@@ -478,8 +478,9 @@ func loadCodexSession(entry codexIndexEntry) *Session {
 	}
 
 	cwd := entry.CWD
+	home, _ := os.UserHomeDir()
 	projectName := lastSegment(cwd)
-	if projectName == "" || strings.HasPrefix(projectName, "20") {
+	if projectName == "" || strings.HasPrefix(projectName, "20") || cwd == home {
 		projectName = "미분류"
 	}
 
@@ -518,8 +519,9 @@ func loadCodexSession(entry codexIndexEntry) *Session {
 			if json.Unmarshal(line.Payload, &meta) == nil && meta.CWD != "" {
 				sess.CWD = meta.CWD
 				sess.ProjectDir = meta.CWD
+				home, _ := os.UserHomeDir()
 				name := lastSegment(meta.CWD)
-				if strings.HasPrefix(name, "20") {
+				if strings.HasPrefix(name, "20") || meta.CWD == home {
 					name = "미분류"
 				}
 				sess.ProjectName = name
@@ -866,10 +868,15 @@ func loadSession(path string) *Session {
 	}
 	dir := filepath.Base(filepath.Dir(path))
 	ppath := decodePath(dir)
+	home, _ := os.UserHomeDir()
+	pname := lastSegment(ppath)
+	if ppath == home {
+		pname = "미분류"
+	}
 	sess := &Session{
 		ID:          strings.TrimSuffix(filepath.Base(path), ".jsonl"),
 		ProjectDir:  ppath,
-		ProjectName: lastSegment(ppath),
+		ProjectName: pname,
 		SessionFile: path,
 		ModTime:     info.ModTime(),
 		FileSize:    info.Size(),
@@ -1234,7 +1241,7 @@ func nodeRefStr(node *tview.TreeNode) string {
 
 // ── Session node text formatting ────────────────────────────────────────────
 
-func sessionNodeText(s *Session, projAliases map[string]string) string {
+func sessionNodeText(s *Session) string {
 	check := " "
 	if s.Selected {
 		check = "\xe2\x9c\x93" // ✓
@@ -1250,7 +1257,7 @@ func sessionNodeText(s *Session, projAliases map[string]string) string {
 	if s.Provider == ProviderCodex {
 		epIco = "DSK"
 	}
-	dateColor := "[#666666]"
+	dateColor := "[#999999]"
 	if daysUntilExpiry(s) < 0 {
 		dateColor = "[#FF4444]"
 	} else if time.Since(s.ModTime) < 2*time.Minute {
@@ -1263,17 +1270,12 @@ func sessionNodeText(s *Session, projAliases map[string]string) string {
 		activeIcon = "[lime]\xe2\x96\xb6[-]"
 	}
 
-	col1 := fmt.Sprintf("%s%s", check, activeIcon)
+	col1 := padRight(fmt.Sprintf("%s%s", check, activeIcon), 3)
 	col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
-	projDisplay := s.ProjectName
-	if pa, ok := projAliases[s.ProjectName]; ok {
-		projDisplay = pa
-	}
-	col3 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(projDisplay)), 20)
-	col4 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
-	col5 := padRight(fmt.Sprintf("[#666666]%s[-]", epIco), 4)
-	col6 := padRight(fmt.Sprintf("[#666666]%s[-]", expiryLabel(s)), 6)
-	return fmt.Sprintf("%s %s  %s  %s  %s  %s", col1, col2, col3, col4, col5, col6)
+	col3 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
+	col4 := padRight(fmt.Sprintf("[#999999]%s[-]", epIco), 4)
+	col5 := padRight(fmt.Sprintf("[#999999]%s[-]", expiryLabel(s)), 6)
+	return fmt.Sprintf("%s%s  %s  %s  %s", col1, col2, col3, col4, col5)
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -1285,6 +1287,7 @@ func main() {
 
 	activeBackend = detectBackend()
 	app := tview.NewApplication()
+	tview.Styles.PrimitiveBackgroundColor = tcell.NewRGBColor(0, 0, 0)
 	summaryCache := make(map[string]string)
 	aliases := loadAliases()
 	localPins := loadPins()
@@ -1549,7 +1552,7 @@ func main() {
 			root.AddChild(provNode)
 
 			// "+ New session" node
-			newNode := tview.NewTreeNode(fmt.Sprintf("  %s+ 새 %s 세션[-]", provColor, provName))
+			newNode := tview.NewTreeNode(fmt.Sprintf("  [#888888]+ 새 %s 세션[-]", provName))
 			newNode.SetReference(newRef)
 			newNode.SetSelectable(true)
 			newNode.SetSelectedTextStyle(selectedStyle)
@@ -1576,7 +1579,7 @@ func main() {
 				pinGroupNode.SetSelectedTextStyle(selectedStyle)
 				provNode.AddChild(pinGroupNode)
 				for _, s := range pinned {
-					sNode := tview.NewTreeNode(sessionNodeText(s, projectAliases))
+					sNode := tview.NewTreeNode(sessionNodeText(s))
 					sNode.SetReference(s)
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
@@ -1609,45 +1612,27 @@ func main() {
 				}
 				for _, projName := range projectOrder {
 					projSessions := projectMap[projName]
-					if len(projectOrder) > 1 {
-						// Add project subgroup node
-						displayProj := projName
-						if pa, ok := projectAliases[projName]; ok {
-							displayProj = pa
+					displayProj := projName
+					if pa, ok := projectAliases[projName]; ok {
+						displayProj = pa
+					}
+					projNode := tview.NewTreeNode(fmt.Sprintf("[#888888]%s[-] (%d)", esc(displayProj), len(projSessions)))
+					projNode.SetReference("proj:" + projName)
+					projNode.SetSelectable(true)
+					projNode.SetExpanded(true)
+					projNode.SetSelectedTextStyle(selectedStyle)
+					normGroupNode.AddChild(projNode)
+					for _, s := range projSessions {
+						sNode := tview.NewTreeNode(sessionNodeText(s))
+						sNode.SetReference(s)
+						sNode.SetSelectable(true)
+						sNode.SetSelectedTextStyle(selectedStyle)
+						projNode.AddChild(sNode)
+						if firstSessionNode == nil {
+							firstSessionNode = sNode
 						}
-						projNode := tview.NewTreeNode(fmt.Sprintf("[#888888]%s[-] (%d)", esc(displayProj), len(projSessions)))
-						projNode.SetReference("proj:" + projName)
-						projNode.SetSelectable(true)
-						projNode.SetExpanded(true)
-						projNode.SetSelectedTextStyle(selectedStyle)
-						normGroupNode.AddChild(projNode)
-						for _, s := range projSessions {
-							sNode := tview.NewTreeNode(sessionNodeText(s, projectAliases))
-							sNode.SetReference(s)
-							sNode.SetSelectable(true)
-							sNode.SetSelectedTextStyle(selectedStyle)
-							projNode.AddChild(sNode)
-							if firstSessionNode == nil {
-								firstSessionNode = sNode
-							}
-							if lastSelectedID != "" && s.ID == lastSelectedID {
-								restoreNode = sNode
-							}
-						}
-					} else {
-						// Only one project — no subgroup needed
-						for _, s := range projSessions {
-							sNode := tview.NewTreeNode(sessionNodeText(s, projectAliases))
-							sNode.SetReference(s)
-							sNode.SetSelectable(true)
-							sNode.SetSelectedTextStyle(selectedStyle)
-							normGroupNode.AddChild(sNode)
-							if firstSessionNode == nil {
-								firstSessionNode = sNode
-							}
-							if lastSelectedID != "" && s.ID == lastSelectedID {
-								restoreNode = sNode
-							}
+						if lastSelectedID != "" && s.ID == lastSelectedID {
+							restoreNode = sNode
 						}
 					}
 				}
@@ -1955,8 +1940,12 @@ func main() {
 	// ── Key bindings ──
 
 	app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		// Skip key mapping when typing in any input field
-		if _, ok := app.GetFocus().(*tview.InputField); ok {
+		// Skip key mapping when in input field or modal
+		focused := app.GetFocus()
+		if _, ok := focused.(*tview.InputField); ok {
+			return ev
+		}
+		if _, ok := focused.(*tview.Button); ok {
 			return ev
 		}
 
@@ -2106,7 +2095,7 @@ func main() {
 						return nil
 					}
 					s.Selected = !s.Selected
-					cur.SetText(sessionNodeText(s, projectAliases))
+					cur.SetText(sessionNodeText(s))
 					statusBar.SetText(defaultStatus())
 					return nil
 
