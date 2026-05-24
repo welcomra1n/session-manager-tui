@@ -1243,7 +1243,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]Space[-] 선택 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]D[-] 일괄삭제\n[yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]Space[-] 선택 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]D[-] 일괄삭제\n[yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1269,6 +1269,39 @@ func main() {
 	previewOpen := false
 	var togglePreview func()
 	currentFilter := ""
+
+	// Sort modes
+	type SortMode int
+	const (
+		SortByDate SortMode = iota
+		SortByName
+		SortByExpiry
+	)
+	sortMode := SortByDate
+	sortLabels := map[SortMode]string{
+		SortByDate:   "날짜순",
+		SortByName:   "이름순",
+		SortByExpiry: "만료순",
+	}
+	sortSessions := func() {
+		switch sortMode {
+		case SortByDate:
+			sort.Slice(sessions, func(i, j int) bool { return sessions[i].ModTime.After(sessions[j].ModTime) })
+		case SortByName:
+			sort.Slice(sessions, func(i, j int) bool {
+				ai, aj := sessions[i].Alias, sessions[j].Alias
+				if ai == "" {
+					ai = sessions[i].FirstUserMsg
+				}
+				if aj == "" {
+					aj = sessions[j].FirstUserMsg
+				}
+				return strings.ToLower(ai) < strings.ToLower(aj)
+			})
+		case SortByExpiry:
+			sort.Slice(sessions, func(i, j int) bool { return daysUntilExpiry(sessions[i]) < daysUntilExpiry(sessions[j]) })
+		}
+	}
 
 	// ── Session display ──
 
@@ -1367,9 +1400,21 @@ func main() {
 		if selected > 0 {
 			sel = fmt.Sprintf(" | [red]%d개 선택됨[-]", selected)
 		}
+		// Count expiring soon sessions
+		expiring := 0
+		for _, s := range sessions {
+			d := daysUntilExpiry(s)
+			if d >= 0 && d <= 3 {
+				expiring++
+			}
+		}
+		expWarn := ""
+		if expiring > 0 {
+			expWarn = fmt.Sprintf(" | [red]⚠ %d개 만료 임박[-]", expiring)
+		}
 		return fmt.Sprintf(
-			"[green]%d개 세션[-] [gray](%s)[-]%s",
-			len(sessions), activeBackend, sel,
+			"[green]%d개 세션[-] [gray](%s · %s)[-]%s%s",
+			len(sessions), activeBackend, sortLabels[sortMode], sel, expWarn,
 		)
 	}
 
@@ -1459,24 +1504,60 @@ func main() {
 				}
 			}
 
-			// Normal group
+			// Normal group — grouped by project
 			if len(normal) > 0 {
 				normGroupNode := tview.NewTreeNode(fmt.Sprintf("[#444444]세션 (%d)[-]", len(normal)))
 				normGroupNode.SetSelectable(true)
 				normGroupNode.SetExpanded(true)
 				normGroupNode.SetSelectedTextStyle(selectedStyle)
 				provNode.AddChild(normGroupNode)
+
+				// Group by project name
+				projectOrder := []string{}
+				projectMap := make(map[string][]*Session)
 				for _, s := range normal {
-					sNode := tview.NewTreeNode(sessionNodeText(s))
-					sNode.SetReference(s)
-					sNode.SetSelectable(true)
-					sNode.SetSelectedTextStyle(selectedStyle)
-					normGroupNode.AddChild(sNode)
-					if firstSessionNode == nil {
-						firstSessionNode = sNode
+					if _, exists := projectMap[s.ProjectName]; !exists {
+						projectOrder = append(projectOrder, s.ProjectName)
 					}
-					if lastSelectedID != "" && s.ID == lastSelectedID {
-						restoreNode = sNode
+					projectMap[s.ProjectName] = append(projectMap[s.ProjectName], s)
+				}
+				for _, projName := range projectOrder {
+					projSessions := projectMap[projName]
+					if len(projectOrder) > 1 {
+						// Add project subgroup node
+						projNode := tview.NewTreeNode(fmt.Sprintf("[#888888]%s[-] (%d)", esc(projName), len(projSessions)))
+						projNode.SetSelectable(true)
+						projNode.SetExpanded(true)
+						projNode.SetSelectedTextStyle(selectedStyle)
+						normGroupNode.AddChild(projNode)
+						for _, s := range projSessions {
+							sNode := tview.NewTreeNode(sessionNodeText(s))
+							sNode.SetReference(s)
+							sNode.SetSelectable(true)
+							sNode.SetSelectedTextStyle(selectedStyle)
+							projNode.AddChild(sNode)
+							if firstSessionNode == nil {
+								firstSessionNode = sNode
+							}
+							if lastSelectedID != "" && s.ID == lastSelectedID {
+								restoreNode = sNode
+							}
+						}
+					} else {
+						// Only one project — no subgroup needed
+						for _, s := range projSessions {
+							sNode := tview.NewTreeNode(sessionNodeText(s))
+							sNode.SetReference(s)
+							sNode.SetSelectable(true)
+							sNode.SetSelectedTextStyle(selectedStyle)
+							normGroupNode.AddChild(sNode)
+							if firstSessionNode == nil {
+								firstSessionNode = sNode
+							}
+							if lastSelectedID != "" && s.ID == lastSelectedID {
+								restoreNode = sNode
+							}
+						}
 					}
 				}
 			}
@@ -1812,6 +1893,13 @@ func main() {
 					savePins(localPins)
 					sessions = discoverSessions()
 					populateTree(currentFilter)
+					return nil
+
+				case 's': // Sort toggle
+					sortMode = (sortMode + 1) % 3
+					sortSessions()
+					populateTree(currentFilter)
+					statusBar.SetText(fmt.Sprintf("[green]정렬: %s[-]", sortLabels[sortMode]))
 					return nil
 
 				case 'r': // Refresh
