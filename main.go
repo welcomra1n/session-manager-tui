@@ -479,8 +479,8 @@ func loadCodexSession(entry codexIndexEntry) *Session {
 
 	cwd := entry.CWD
 	projectName := lastSegment(cwd)
-	if projectName == "" {
-		projectName = "codex"
+	if projectName == "" || strings.HasPrefix(projectName, "20") {
+		projectName = "미분류"
 	}
 
 	sess := &Session{
@@ -518,7 +518,11 @@ func loadCodexSession(entry codexIndexEntry) *Session {
 			if json.Unmarshal(line.Payload, &meta) == nil && meta.CWD != "" {
 				sess.CWD = meta.CWD
 				sess.ProjectDir = meta.CWD
-				sess.ProjectName = lastSegment(meta.CWD)
+				name := lastSegment(meta.CWD)
+				if strings.HasPrefix(name, "20") {
+					name = "미분류"
+				}
+				sess.ProjectName = name
 			}
 			continue
 		}
@@ -654,6 +658,27 @@ func removeFromCodexIndex(id string) {
 
 // ── Codex pin detection ─────────────────────────────────────────────────────
 
+func saveCodexPins(pins map[string]bool) {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".codex", ".codex-global-state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var state map[string]json.RawMessage
+	if json.Unmarshal(data, &state) != nil {
+		return
+	}
+	var ids []string
+	for id := range pins {
+		ids = append(ids, id)
+	}
+	raw, _ := json.Marshal(ids)
+	state["pinned-thread-ids"] = raw
+	out, _ := json.MarshalIndent(state, "", "  ")
+	os.WriteFile(path, out, 0644)
+}
+
 func loadCodexPins() map[string]bool {
 	home, _ := os.UserHomeDir()
 	data, err := os.ReadFile(filepath.Join(home, ".codex", ".codex-global-state.json"))
@@ -686,6 +711,34 @@ func pinFilePath() string {
 	return filepath.Join(home, ".claude", "session-pins.json")
 }
 
+func unpinFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "session-unpins.json")
+}
+
+func loadUnpins() map[string]bool {
+	unpins := make(map[string]bool)
+	data, err := os.ReadFile(unpinFilePath())
+	if err == nil {
+		var ids []string
+		if json.Unmarshal(data, &ids) == nil {
+			for _, id := range ids {
+				unpins[id] = true
+			}
+		}
+	}
+	return unpins
+}
+
+func saveUnpins(unpins map[string]bool) {
+	var ids []string
+	for id := range unpins {
+		ids = append(ids, id)
+	}
+	data, _ := json.MarshalIndent(ids, "", "  ")
+	os.WriteFile(unpinFilePath(), data, 0644)
+}
+
 func loadPins() map[string]bool {
 	// Load our local pins
 	pins := make(map[string]bool)
@@ -698,10 +751,13 @@ func loadPins() map[string]bool {
 			}
 		}
 	}
-	// Also load Codex desktop pins
+	// Also load Codex desktop pins (minus locally unpinned)
+	unpins := loadUnpins()
 	codexPins := loadCodexPins()
 	for id := range codexPins {
-		pins[id] = true
+		if !unpins[id] {
+			pins[id] = true
+		}
 	}
 	return pins
 }
@@ -719,6 +775,30 @@ func savePins(pins map[string]bool) error {
 }
 
 // ── Alias persistence ───────────────────────────────────────────────────────
+
+// ── Project alias persistence ────────────────────────────────────────────────
+
+func projectAliasFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "project-aliases.json")
+}
+
+func loadProjectAliases() map[string]string {
+	data, err := os.ReadFile(projectAliasFilePath())
+	if err != nil {
+		return make(map[string]string)
+	}
+	var aliases map[string]string
+	if json.Unmarshal(data, &aliases) != nil {
+		return make(map[string]string)
+	}
+	return aliases
+}
+
+func saveProjectAliases(aliases map[string]string) {
+	data, _ := json.MarshalIndent(aliases, "", "  ")
+	os.WriteFile(projectAliasFilePath(), data, 0644)
+}
 
 func aliasFilePath() string {
 	home, _ := os.UserHomeDir()
@@ -1154,7 +1234,7 @@ func nodeRefStr(node *tview.TreeNode) string {
 
 // ── Session node text formatting ────────────────────────────────────────────
 
-func sessionNodeText(s *Session) string {
+func sessionNodeText(s *Session, projAliases map[string]string) string {
 	check := " "
 	if s.Selected {
 		check = "\xe2\x9c\x93" // ✓
@@ -1185,7 +1265,11 @@ func sessionNodeText(s *Session) string {
 
 	col1 := fmt.Sprintf("%s%s", check, activeIcon)
 	col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
-	col3 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(s.ProjectName)), 20)
+	projDisplay := s.ProjectName
+	if pa, ok := projAliases[s.ProjectName]; ok {
+		projDisplay = pa
+	}
+	col3 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(projDisplay)), 20)
 	col4 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
 	col5 := padRight(fmt.Sprintf("[#666666]%s[-]", epIco), 4)
 	col6 := padRight(fmt.Sprintf("[#666666]%s[-]", expiryLabel(s)), 6)
@@ -1204,6 +1288,8 @@ func main() {
 	summaryCache := make(map[string]string)
 	aliases := loadAliases()
 	localPins := loadPins()
+	localUnpins := loadUnpins()
+	projectAliases := loadProjectAliases()
 
 	// ── Widgets ──
 
@@ -1243,7 +1329,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]Space[-] 선택 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]D[-] 일괄삭제\n[yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제\n[yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1490,7 +1576,7 @@ func main() {
 				pinGroupNode.SetSelectedTextStyle(selectedStyle)
 				provNode.AddChild(pinGroupNode)
 				for _, s := range pinned {
-					sNode := tview.NewTreeNode(sessionNodeText(s))
+					sNode := tview.NewTreeNode(sessionNodeText(s, projectAliases))
 					sNode.SetReference(s)
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
@@ -1525,13 +1611,18 @@ func main() {
 					projSessions := projectMap[projName]
 					if len(projectOrder) > 1 {
 						// Add project subgroup node
-						projNode := tview.NewTreeNode(fmt.Sprintf("[#888888]%s[-] (%d)", esc(projName), len(projSessions)))
+						displayProj := projName
+						if pa, ok := projectAliases[projName]; ok {
+							displayProj = pa
+						}
+						projNode := tview.NewTreeNode(fmt.Sprintf("[#888888]%s[-] (%d)", esc(displayProj), len(projSessions)))
+						projNode.SetReference("proj:" + projName)
 						projNode.SetSelectable(true)
 						projNode.SetExpanded(true)
 						projNode.SetSelectedTextStyle(selectedStyle)
 						normGroupNode.AddChild(projNode)
 						for _, s := range projSessions {
-							sNode := tview.NewTreeNode(sessionNodeText(s))
+							sNode := tview.NewTreeNode(sessionNodeText(s, projectAliases))
 							sNode.SetReference(s)
 							sNode.SetSelectable(true)
 							sNode.SetSelectedTextStyle(selectedStyle)
@@ -1546,7 +1637,7 @@ func main() {
 					} else {
 						// Only one project — no subgroup needed
 						for _, s := range projSessions {
-							sNode := tview.NewTreeNode(sessionNodeText(s))
+							sNode := tview.NewTreeNode(sessionNodeText(s, projectAliases))
 							sNode.SetReference(s)
 							sNode.SetSelectable(true)
 							sNode.SetSelectedTextStyle(selectedStyle)
@@ -1604,8 +1695,7 @@ func main() {
 
 	// ── Actions ──
 
-	newSession := func(provider Provider) {
-		home, _ := os.UserHomeDir()
+	newSessionInDir := func(provider Provider, dir string) {
 		var cmd, label string
 		if provider == ProviderCodex {
 			cmd = "codex --sandbox danger-full-access"
@@ -1614,21 +1704,103 @@ func main() {
 			cmd = "claude --dangerously-skip-permissions"
 			label = "Claude"
 		}
-		err := openInTerminal(cmd, home, true, app)
+		err := openInTerminal(cmd, dir, true, app)
 		if err != nil {
 			statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
 		} else {
-			statusBar.SetText(fmt.Sprintf("[green]새 %s 세션[-]", label))
+			statusBar.SetText(fmt.Sprintf("[green]새 %s 세션 (%s)[-]", label, lastSegment(dir)))
 			go func() {
 				time.Sleep(2 * time.Second)
 				fresh := discoverSessions()
 				app.QueueUpdateDraw(func() {
 					sessions = fresh
 					aliases = loadAliases()
+					sortSessions()
 					populateTree(currentFilter)
 				})
 			}()
 		}
+	}
+
+	newSession := func(provider Provider) {
+		home, _ := os.UserHomeDir()
+
+		// Collect unique project dirs for this provider
+		projectDirs := make(map[string]string) // name → path
+		var projectNames []string
+		for _, s := range sessions {
+			if s.Provider == provider && s.ProjectDir != "" {
+				name := s.ProjectName
+				if _, exists := projectDirs[name]; !exists {
+					// Verify dir exists
+					if _, err := os.Stat(s.ProjectDir); err == nil {
+						projectDirs[name] = s.ProjectDir
+						projectNames = append(projectNames, name)
+					}
+				}
+			}
+		}
+
+		// If only home dir or no projects, open directly
+		if len(projectDirs) <= 1 {
+			newSessionInDir(provider, home)
+			return
+		}
+
+		// Show project selection list (vertical)
+		label := "Claude"
+		if provider == ProviderCodex {
+			label = "Codex"
+		}
+
+		pickList := tview.NewList().
+			ShowSecondaryText(false).
+			SetHighlightFullLine(true).
+			SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorGreen).Foreground(tcell.ColorWhite))
+
+		// Add home first
+		pickList.AddItem("  홈 ("+lastSegment(home)+")", "", 0, nil)
+		pickDirs := []string{home}
+		for _, name := range projectNames {
+			if projectDirs[name] != home {
+				pickList.AddItem("  "+name, "", 0, nil)
+				pickDirs = append(pickDirs, projectDirs[name])
+			}
+		}
+
+		pickList.SetSelectedFunc(func(idx int, _, _ string, _ rune) {
+			if idx < len(pickDirs) {
+				newSessionInDir(provider, pickDirs[idx])
+			}
+			app.SetRoot(mainLayout, true)
+			app.SetFocus(tree)
+		})
+		pickList.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+			if ev.Key() == tcell.KeyEscape {
+				app.SetRoot(mainLayout, true)
+				app.SetFocus(tree)
+				return nil
+			}
+			return ev
+		})
+		pickList.SetBorder(true).
+			SetTitle(fmt.Sprintf(" 새 %s 세션 — 프로젝트 선택 ", label)).
+			SetTitleAlign(tview.AlignCenter).
+			SetBorderColor(tcell.ColorGreen).
+			SetBackgroundColor(tcell.ColorDarkSlateGray)
+
+		modalFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(tview.NewFlex().
+				AddItem(nil, 0, 1, false).
+				AddItem(pickList, 40, 0, true).
+				AddItem(nil, 0, 1, false), len(pickDirs)+2, 0, true).
+			AddItem(nil, 0, 1, false)
+		pages := tview.NewPages().
+			AddPage("main", mainLayout, true, true).
+			AddPage("pick", modalFlex, true, true)
+		app.SetRoot(pages, true)
+		app.SetFocus(pickList)
 	}
 
 	openSessionFromNode := func(node *tview.TreeNode, inTab bool) {
@@ -1881,17 +2053,28 @@ func main() {
 					if s == nil {
 						return nil
 					}
+					// Also sync with Codex desktop
+					codexPins := loadCodexPins()
 					if s.Pinned {
 						s.Pinned = false
 						delete(localPins, s.ID)
+						delete(codexPins, s.ID)
+						localUnpins[s.ID] = true
 						statusBar.SetText(fmt.Sprintf("[yellow]고정 해제: %s[-]", esc(s.ProjectName)))
 					} else {
 						s.Pinned = true
 						localPins[s.ID] = true
+						delete(localUnpins, s.ID)
+						if s.Provider == ProviderCodex {
+							codexPins[s.ID] = true
+						}
 						statusBar.SetText(fmt.Sprintf("[green]📌 고정: %s[-]", esc(s.ProjectName)))
 					}
 					savePins(localPins)
+					saveUnpins(localUnpins)
+					saveCodexPins(codexPins)
 					sessions = discoverSessions()
+					sortSessions()
 					populateTree(currentFilter)
 					return nil
 
@@ -1923,12 +2106,60 @@ func main() {
 						return nil
 					}
 					s.Selected = !s.Selected
-					cur.SetText(sessionNodeText(s))
+					cur.SetText(sessionNodeText(s, projectAliases))
 					statusBar.SetText(defaultStatus())
 					return nil
 
-				case 'm': // Rename (alias)
+				case 'm': // Rename (alias) — session or project group
 					cur := tree.GetCurrentNode()
+
+					// Check if it's a project group node
+					refStr := nodeRefStr(cur)
+					if strings.HasPrefix(refStr, "proj:") {
+						projName := strings.TrimPrefix(refStr, "proj:")
+						currentAlias := projectAliases[projName]
+						renameInput := tview.NewInputField().
+							SetLabel(" 새 이름: ").
+							SetText(currentAlias).
+							SetFieldWidth(40).
+							SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
+						renameInput.SetBorder(true).
+							SetTitle(" 프로젝트 이름 변경 ").
+							SetTitleAlign(tview.AlignCenter)
+						renameInput.SetDoneFunc(func(key tcell.Key) {
+							if key == tcell.KeyEnter {
+								newAlias := strings.TrimSpace(renameInput.GetText())
+								if newAlias == "" {
+									delete(projectAliases, projName)
+								} else {
+									projectAliases[projName] = newAlias
+								}
+								saveProjectAliases(projectAliases)
+								populateTree(currentFilter)
+								if newAlias != "" {
+									statusBar.SetText(fmt.Sprintf("[green]프로젝트 이름 변경: %s → %s[-]", esc(projName), esc(newAlias)))
+								} else {
+									statusBar.SetText("[green]프로젝트 별칭 삭제됨[-]")
+								}
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+						})
+						modal := tview.NewFlex().SetDirection(tview.FlexRow).
+							AddItem(nil, 0, 1, false).
+							AddItem(tview.NewFlex().
+								AddItem(nil, 0, 1, false).
+								AddItem(renameInput, 50, 0, true).
+								AddItem(nil, 0, 1, false), 3, 0, true).
+							AddItem(nil, 0, 1, false)
+						pages := tview.NewPages().
+							AddPage("main", mainLayout, true, true).
+							AddPage("rename", modal, true, true)
+						app.SetRoot(pages, true)
+						app.SetFocus(renameInput)
+						return nil
+					}
+
 					s := nodeSession(cur)
 					if s == nil {
 						return nil
@@ -1976,9 +2207,72 @@ func main() {
 					app.SetFocus(renameInput)
 					return nil
 
-				case 'd': // Delete single session
+				case 'd': // Delete session or group
 					cur := tree.GetCurrentNode()
 					s := nodeSession(cur)
+
+					// Check if it's a group node with children sessions
+					if s == nil && cur != nil {
+						children := cur.GetChildren()
+						var groupSessions []*Session
+						for _, child := range children {
+							if cs := nodeSession(child); cs != nil {
+								groupSessions = append(groupSessions, cs)
+							}
+						}
+						if len(groupSessions) == 0 {
+							return nil
+						}
+						groupName := cur.GetText()
+						confirmModal := tview.NewModal().
+							SetText(fmt.Sprintf("%s\n\n%d개 세션을 삭제하시겠습니까?", groupName, len(groupSessions))).
+							AddButtons([]string{"삭제", "취소"}).
+							SetDoneFunc(func(_ int, label string) {
+								if label == "삭제" {
+									deleted := 0
+									for _, gs := range groupSessions {
+										if deleteSession(gs) == nil {
+											delete(aliases, gs.ID)
+											deleted++
+										}
+									}
+									saveAliases(aliases)
+									sessions = discoverSessions()
+									sortSessions()
+									populateTree(currentFilter)
+									statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+								}
+								app.SetRoot(mainLayout, true)
+								app.SetFocus(tree)
+							})
+						confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+						confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+						confirmModal.SetButtonTextColor(tcell.ColorGray)
+						confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+						confirmModal.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+							if ev.Key() == tcell.KeyRune && toEngKey(ev.Rune()) == 'd' {
+								deleted := 0
+								for _, gs := range groupSessions {
+									if deleteSession(gs) == nil {
+										delete(aliases, gs.ID)
+										deleted++
+									}
+								}
+								saveAliases(aliases)
+								sessions = discoverSessions()
+								sortSessions()
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+								app.SetRoot(mainLayout, true)
+								app.SetFocus(tree)
+								return nil
+							}
+							return ev
+						})
+						app.SetRoot(confirmModal, true)
+						return nil
+					}
+
 					if s == nil {
 						return nil
 					}
@@ -1997,6 +2291,7 @@ func main() {
 									delete(aliases, s.ID)
 									saveAliases(aliases)
 									sessions = discoverSessions()
+									sortSessions()
 									populateTree(currentFilter)
 									statusBar.SetText(fmt.Sprintf("[green]삭제됨: %s[-]", esc(displayName)))
 								}
@@ -2005,50 +2300,28 @@ func main() {
 							app.SetFocus(tree)
 						})
 					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
-					confirmModal.SetButtonBackgroundColor(tcell.ColorDimGray)
-					confirmModal.SetButtonTextColor(tcell.ColorWhite)
-					confirmModal.SetFocus(0) // focus on Delete button
-					// Style: focused button = bright, unfocused = dim
-					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite))
-					app.SetRoot(confirmModal, true)
-					return nil
-
-				case 'D': // Delete all selected sessions
-					var selected []*Session
-					for _, s := range sessions {
-						if s.Selected {
-							selected = append(selected, s)
-						}
-					}
-					if len(selected) == 0 {
-						statusBar.SetText("[yellow]선택된 세션 없음. Space로 선택하세요.[-]")
-						return nil
-					}
-					confirmModal := tview.NewModal().
-						SetText(fmt.Sprintf("%d개 세션을 삭제하시겠습니까?", len(selected))).
-						AddButtons([]string{"전체 삭제", "취소"}).
-						SetDoneFunc(func(_ int, label string) {
-							if label == "전체 삭제" {
-								deleted := 0
-								for _, s := range selected {
-									if deleteSession(s) == nil {
-										delete(aliases, s.ID)
-										deleted++
-									}
-								}
+					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+					confirmModal.SetButtonTextColor(tcell.ColorGray)
+					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+					// Allow 'd' key to confirm delete in modal
+					confirmModal.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						if ev.Key() == tcell.KeyRune && toEngKey(ev.Rune()) == 'd' {
+							if err := deleteSession(s); err != nil {
+								statusBar.SetText(fmt.Sprintf("[red]삭제 실패: %v[-]", err))
+							} else {
+								delete(aliases, s.ID)
 								saveAliases(aliases)
 								sessions = discoverSessions()
+								sortSessions()
 								populateTree(currentFilter)
-								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+								statusBar.SetText(fmt.Sprintf("[green]삭제됨: %s[-]", esc(displayName)))
 							}
 							app.SetRoot(mainLayout, true)
 							app.SetFocus(tree)
-						})
-					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
-					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
-					confirmModal.SetButtonTextColor(tcell.ColorGray)
-					confirmModal.SetFocus(0)
-					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+							return nil
+						}
+						return ev
+					})
 					app.SetRoot(confirmModal, true)
 					return nil
 
