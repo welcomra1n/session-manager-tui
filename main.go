@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,40 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+// ── Version & update check ──────────────────────────────────────────────────
+
+const currentVersion = "0.1.0"
+
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	HTMLURL string `json:"html_url"`
+}
+
+func checkForUpdate() (newVersion, url string, hasUpdate bool) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/welcomra1n/session-manager-tui/releases/latest")
+	if err != nil {
+		return "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", false
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", false
+	}
+	var release githubRelease
+	if json.Unmarshal(body, &release) != nil {
+		return "", "", false
+	}
+	tag := strings.TrimPrefix(release.TagName, "v")
+	if tag != "" && tag != currentVersion {
+		return tag, release.HTMLURL, true
+	}
+	return "", "", false
+}
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -1334,6 +1370,28 @@ func highlightText(text, query string) string {
 	return text[:idx] + "[yellow]" + text[idx:idx+len(query)] + "[-][white]" + text[idx+len(query):]
 }
 
+func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
+	activeIcon := " "
+	if s.Active {
+		activeIcon = "[lime]▶[-]"
+	}
+	title := s.Alias
+	if title == "" {
+		title = trunc(s.FirstUserMsg, 25)
+	}
+	if title == "" {
+		title = fmt.Sprintf("%d개", s.MessageCount)
+	}
+	displayTitle := title
+	if len(searchQuery) > 0 && searchQuery[0] != "" {
+		displayTitle = highlightText(title, searchQuery[0])
+	}
+	col1 := padRight(activeIcon, 2)
+	col2 := padRight(fmt.Sprintf("[white]%s[-]", esc(displayTitle)), 22)
+	col3 := padRight(fmt.Sprintf("[#999999]%s[-]", expiryLabel(s)), 5)
+	return fmt.Sprintf("%s%s %s", col1, col2, col3)
+}
+
 func sessionNodeText(s *Session, searchQuery ...string) string {
 	check := " "
 	if s.Selected {
@@ -1391,6 +1449,8 @@ func main() {
 	localPins := loadPins()
 	localUnpins := loadUnpins()
 	projectAliases := loadProjectAliases()
+	compactMode := false
+	var updateInfo string // set by background check
 
 	// ── Widgets ──
 
@@ -1430,7 +1490,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]x[-] 휴지통 | [yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]Space[-] 선택 | [yellow]D[-] 일괄삭제 | [yellow]E[-] 일괄내보내기 | [yellow]c[-] 컴팩트 | [yellow]x[-] 휴지통 | [yellow]/[-] 검색 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1613,9 +1673,17 @@ func main() {
 		if active > 0 {
 			activeInfo = fmt.Sprintf(" | [lime]▶ %d 활성[-]", active)
 		}
+		updateNote := ""
+		if updateInfo != "" {
+			updateNote = " | " + updateInfo
+		}
+		compactNote := ""
+		if compactMode {
+			compactNote = " | [aqua]컴팩트[-]"
+		}
 		return fmt.Sprintf(
-			"[green]%d개 세션[-] [gray](🧠%d 🤖%d · %d개 메시지 · %s · %s)[-]%s%s%s",
-			len(sessions), claudeCount, codexCount, totalMsgs, activeBackend, sortLabels[sortMode], sel, activeInfo, expWarn)
+			"[green]%d개 세션[-] [gray](🧠%d 🤖%d · %d개 메시지 · %s · %s)[-]%s%s%s%s%s",
+			len(sessions), claudeCount, codexCount, totalMsgs, activeBackend, sortLabels[sortMode], sel, activeInfo, expWarn, compactNote, updateNote)
 	}
 
 	// Track the previously selected session ID to restore after rebuild
@@ -1690,7 +1758,11 @@ func main() {
 				pinGroupNode.SetSelectedTextStyle(selectedStyle)
 				provNode.AddChild(pinGroupNode)
 				for _, s := range pinned {
-					sNode := tview.NewTreeNode(sessionNodeText(s, filter))
+					nodeText := sessionNodeText(s, filter)
+					if compactMode {
+						nodeText = sessionNodeTextCompact(s, filter)
+					}
+					sNode := tview.NewTreeNode(nodeText)
 					sNode.SetReference(s)
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
@@ -1744,7 +1816,11 @@ func main() {
 					projNode.SetSelectedTextStyle(selectedStyle)
 					normGroupNode.AddChild(projNode)
 					for _, s := range projSessions {
-						sNode := tview.NewTreeNode(sessionNodeText(s, filter))
+						nodeText := sessionNodeText(s, filter)
+					if compactMode {
+						nodeText = sessionNodeTextCompact(s, filter)
+					}
+					sNode := tview.NewTreeNode(nodeText)
 						sNode.SetReference(s)
 						sNode.SetSelectable(true)
 						sNode.SetSelectedTextStyle(selectedStyle)
@@ -2129,8 +2205,9 @@ func main() {
 							"  D-29 = 29일 남음  |  D+3 = 3일 전 만료\n\n" +
 							"[white]단축키:[-]\n" +
 							"  Enter=열기    p=미리보기   Space=선택   m=이름변경\n" +
-							"  d=삭제       D=일괄삭제   o=폴더      /=검색\n" +
-							"  r=새로고침   Esc=종료     ?=도움말\n\n" +
+							"  d=삭제       D=일괄삭제   E=일괄내보내기  e=내보내기\n" +
+							"  c=컴팩트     o=폴더      /=검색       r=새로고침\n" +
+							"  t=고정       s=정렬      x=휴지통     Esc=종료\n\n" +
 							"[gray]아무 키나 누르면 닫힘[-]",
 					)
 					helpText.SetBorder(true).
@@ -2224,7 +2301,11 @@ func main() {
 						return nil
 					}
 					s.Selected = !s.Selected
-					cur.SetText(sessionNodeText(s, currentFilter))
+					if compactMode {
+						cur.SetText(sessionNodeTextCompact(s, currentFilter))
+					} else {
+						cur.SetText(sessionNodeText(s, currentFilter))
+					}
 					statusBar.SetText(defaultStatus())
 					return nil
 
@@ -2573,11 +2654,143 @@ func main() {
 						statusBar.SetText(fmt.Sprintf("[green]내보내기 완료: %s[-]", esc(exportPath)))
 					}
 					return nil
+
+				case 'D': // Batch delete selected sessions
+					var selected []*Session
+					for _, s := range sessions {
+						if s.Selected {
+							selected = append(selected, s)
+						}
+					}
+					if len(selected) == 0 {
+						statusBar.SetText("[yellow]선택된 세션이 없습니다 (Space로 선택)[-]")
+						return nil
+					}
+					confirmModal := tview.NewModal().
+						SetText(fmt.Sprintf("%d개 선택된 세션을 삭제하시겠습니까?", len(selected))).
+						AddButtons([]string{"삭제", "취소"}).
+						SetDoneFunc(func(_ int, label string) {
+							if label == "삭제" {
+								deleted := 0
+								for _, s := range selected {
+									if deleteSession(s) == nil {
+										delete(aliases, s.ID)
+										deleted++
+									}
+								}
+								saveAliases(aliases)
+								sessions = discoverSessions()
+								sortSessions()
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+						})
+					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+					confirmModal.SetButtonTextColor(tcell.ColorGray)
+					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+					confirmModal.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						if ev.Key() == tcell.KeyRune && toEngKey(ev.Rune()) == 'd' {
+							deleted := 0
+							for _, s := range selected {
+								if deleteSession(s) == nil {
+									delete(aliases, s.ID)
+									deleted++
+								}
+							}
+							saveAliases(aliases)
+							sessions = discoverSessions()
+							sortSessions()
+							populateTree(currentFilter)
+							statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+							return nil
+						}
+						return ev
+					})
+					app.SetRoot(confirmModal, true)
+					return nil
+
+				case 'E': // Batch export selected sessions
+					var selected []*Session
+					for _, s := range sessions {
+						if s.Selected {
+							selected = append(selected, s)
+						}
+					}
+					if len(selected) == 0 {
+						statusBar.SetText("[yellow]선택된 세션이 없습니다 (Space로 선택)[-]")
+						return nil
+					}
+					home, _ := os.UserHomeDir()
+					exported := 0
+					for _, s := range selected {
+						title := s.Alias
+						if title == "" {
+							title = trunc(s.FirstUserMsg, 30)
+						}
+						if title == "" {
+							title = s.ID[:8]
+						}
+						safeName := strings.Map(func(r rune) rune {
+							if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+								return '_'
+							}
+							return r
+						}, title)
+						exportPath := filepath.Join(home, "Desktop", safeName+".md")
+
+						var md strings.Builder
+						md.WriteString(fmt.Sprintf("# %s\n\n", title))
+						md.WriteString(fmt.Sprintf("- **세션 ID**: %s\n", s.ID))
+						md.WriteString(fmt.Sprintf("- **프로젝트**: %s\n", s.ProjectName))
+						md.WriteString(fmt.Sprintf("- **날짜**: %s\n", s.ModTime.Format("2006-01-02 15:04:05")))
+						md.WriteString(fmt.Sprintf("- **메시지**: %d개\n\n", s.MessageCount))
+						md.WriteString("---\n\n")
+						for _, msg := range s.Messages {
+							if msg.Type == "user" {
+								md.WriteString("## 👤 사용자\n\n")
+							} else {
+								md.WriteString("## 🤖 어시스턴트\n\n")
+							}
+							md.WriteString(msg.Content + "\n\n")
+						}
+						if os.WriteFile(exportPath, []byte(md.String()), 0644) == nil {
+							exported++
+							s.Selected = false
+						}
+					}
+					populateTree(currentFilter)
+					statusBar.SetText(fmt.Sprintf("[green]%d개 세션 내보내기 완료 (바탕화면)[-]", exported))
+					return nil
+
+				case 'c': // Compact mode toggle
+					compactMode = !compactMode
+					populateTree(currentFilter)
+					if compactMode {
+						statusBar.SetText("[aqua]컴팩트 모드 ON[-]")
+					} else {
+						statusBar.SetText("[green]컴팩트 모드 OFF[-]")
+					}
+					return nil
 				}
 			}
 		}
 		return ev
 	})
+
+	// Background update check
+	go func() {
+		if newVer, _, has := checkForUpdate(); has {
+			app.QueueUpdateDraw(func() {
+				updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
+				statusBar.SetText(defaultStatus())
+			})
+		}
+	}()
 
 	// Background polling: auto-refresh every 10 seconds
 	go func() {
