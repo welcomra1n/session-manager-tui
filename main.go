@@ -2420,10 +2420,6 @@ func main() {
 		case tcell.KeyRune:
 			if focusIdx == 0 {
 				switch toEngKey(ev.Rune()) {
-				case 'q':
-					app.Stop()
-					return nil
-
 				case '/':
 					showSearch()
 					return nil
