@@ -1,106 +1,134 @@
-# claude-session-manager-tui
+# session-manager-tui
 
-A terminal UI for browsing and managing [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions. Browse all your past sessions across projects, preview conversations, generate AI summaries, and resume sessions in your preferred terminal.
+Claude Code + Codex 세션을 통합 관리하는 터미널 UI. 세션 검색, 미리보기, 고정, 삭제, AI 요약, 새 세션 생성을 하나의 TUI에서.
 
-## Screenshot
+> [borball/claude-session-manager-tui](https://github.com/borball/claude-session-manager-tui) fork
+
+## 스크린샷
 
 ```
-┌ Sessions ════════════════════════┐┌ Session Info ══════════════════════════════════════┐
-│(03/31 14:22) my-web-app          ││Project:     my-web-app                             │
-│  add dark mode toggle to navbar  ││Path:        /Users/dev/projects/my-web-app          │
-│(03/31 11:05) api-server          ││Session:     a1b2c3d4-e5f6-7890-abcd-ef1234567890   │
-│  fix rate limiting on /api/v2    ││Modified:    2026-03-31 14:22:18                     │
-│(03/31 09:30) infra-terraform     ││Size:        2.1 MB                                  │
-│  migrate from aws to gcp module  ││Messages:    42 (18 user, 24 asst)                   │
-│(03/30 16:45) mobile-app          ││Git Branch:  feature/dark-mode                       │
-│  implement push notifications    ││CWD:         /Users/dev/projects/my-web-app          │
-│(03/30 10:12) data-pipeline       ││                                                     │
-│  debug kafka consumer lag issue  ││First msg:                                            │
-│────────────────────────────────  ││  add dark mode toggle to the navbar, use tailwind    │
-│(03/22 09:15) docs-site           ││                                                     │
-│  update API reference for v3     ││── AI Summary ──                                     │
-│(03/18 14:30) legacy-monolith     ││- Added dark mode toggle component to navbar         │
-│  refactor auth middleware        ││- Implemented CSS custom properties for theme colors  │
-│(03/15 11:22) cli-tool            ││- Added localStorage persistence for user preference  │
-│  add --json output flag          ││- Tests passing, PR ready for review                  │
-│                                  │├─────────────────────────────────────────────────────┤
-│                                  ││ Conversation Preview ═══════════════════════════════ │
-│                                  ││>>> User:                                             │
-│                                  ││add dark mode toggle to the navbar, use tailwind      │
-│                                  ││css dark: variants. persist the preference in         │
-│                                  ││localStorage                                          │
-│                                  ││                                                      │
-│                                  ││<<< Assistant:                                        │
-│                                  ││I'll add a dark mode toggle to the navbar. Let me      │
-│                                  ││start by examining the current navbar component...     │
-│                                  ││                                                      │
-│                                  ││>>> User:                                              │
-│                                  ││looks good, but can you also update the footer?        │
-└──────────────────────────────────┘└──────────────────────────────────────────────────────┘
- 29 sessions (iTerm2) | Enter tab | s split | i summary | / search | r refresh | q quit
+┌ 세션 목록 ═══════════════════════════════════════════════════════════════┐
+│── Claude 🧠 (5) ──                                                       │
+│   + 새 Claude 세션                                                       │
+│   ▼ 고정 📌 (1)                                                          │
+│   └ ▶ 05/24 09:15  welcomra1n         멀티 세션 매니저       CLI  D-29   │
+│   ▼ 세션 (4)                                                             │
+│   ├   05/22 19:30  Keynimal           아이폰 기본 키보드     DSK  D-29   │
+│   ├   05/19 19:51  welcomra1n         하네스 에르메스?       CLI  D-26   │
+│   └   05/03 23:50  DearCal            다른사람들이 사용할…   DSK  D-10   │
+│                                                                           │
+│── Codex 🤖 (12) ──                                                       │
+│   + 새 Codex 세션                                                        │
+│   ▶ 고정 📌 (1)                                                          │
+│   ▼ 세션 (11)                                                            │
+│   ├   05/23 21:58  _Deisgnerd(2022)   디자이너드 웹          DSK  D-29   │
+│   ├   05/23 10:27  Dropbox            차량 관리 담당관       DSK  D-29   │
+│   └   04/13 12:08  _Deisgnerd(2022)   메일 정리              DSK  D+10  │
+└───────────────────────────────────────────────────────────────────────────┘
+ Enter 열기 | p 미리보기 | t 고정 | Space 선택 | m 이름변경 | d 삭제 | D 일괄삭제
+ o 폴더 | / 검색 | r 새로고침 | ? 도움말 | Esc 종료
+                              13개 세션 (Ghostty)
 ```
 
-## Features
+## 주요 기능
 
-- **Session browser** — Discovers all Claude Code sessions from `~/.claude/projects/`, split into recent (last 7 days, green) and older (gray) with a divider line
-- **Session info** — Project path, session ID, modification time, message counts, git branch, first/last meaningful user messages
-- **Conversation preview** — Scrollable view of the full conversation with color-coded user/assistant messages
-- **Search & filter** — Real-time search across project names, messages, and git branches (`/` to activate)
-- **AI summaries** — On-demand session summaries powered by Claude Haiku (`i` to generate), cached in memory
-- **Multi-terminal support** — Auto-detects your terminal and opens sessions natively:
+### 통합 세션 관리
+- **Claude Code + Codex** 세션을 하나의 목록에서 관리
+- 🧠 Claude / 🤖 Codex 아이콘으로 구분
+- `CLI` / `DSK` / `WEB` entrypoint 표시
 
-  | Terminal | Detection | Tab (`Enter`) | Split (`s`) |
-  |----------|-----------|---------------|-------------|
-  | iTerm2 | `TERM_PROGRAM=iTerm.app` | New tab | Vertical split |
-  | Terminal.app | `TERM_PROGRAM=Apple_Terminal` | New tab | New window |
-  | tmux | `TMUX` env var | New window | Horizontal split |
-  | Kitty | `KITTY_PID` env var | New tab | New window |
-  | WezTerm | `TERM_PROGRAM=WezTerm` | New tab | Split pane |
-  | Fallback | None of above | Suspends TUI | Same |
+### 세션 구조
+- **새 세션** — 그룹 상단에서 바로 생성
+- **고정 세션 📌** — `t`키로 고정/해제, Codex 데스크탑 고정 자동 반영
+- **일반 세션** — 날짜순 정렬
+- **←/→ 방향키** — 고정/일반 그룹 접기/펼치기
 
-## Install
+### 세션 정보
+- **D-day 만료 표시** — 30일 기준 (D-29, D+3 등)
+- **활성 세션 감지** — ▶ 아이콘 (2분 이내 수정)
+- **날짜 색상** — 파랑(2분), 초록(7일), 회색(이후), 빨강(만료)
+- **프로젝트 폴더명** — Codex는 session_meta CWD에서 읽음
 
-Requires Go 1.21+ and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI.
+### 세션 관리
+- **리네임** (`m`) — 별칭 저장. Claude Code `/rename` 자동 연동
+- **삭제** (`d`) — 단일 삭제 (확인 모달)
+- **일괄 삭제** (`Space` 선택 → `D`) — 다중 삭제
+- **폴더 열기** (`o`) — Finder에서 세션 파일 위치 열기
+- **미리보기** (`p`) — 세션 정보 + 대화 미리보기 패널
+- **AI 요약** (`i`) — Claude Haiku로 세션 요약 생성
+- **검색** (`/`) — 프로젝트명, 별칭, 메시지 검색
+
+### 터미널 지원
+
+| 터미널 | 감지 | 세션 열기 |
+|--------|------|----------|
+| Ghostty | `TERM_PROGRAM=ghostty` | 새 창 |
+| iTerm2 | `TERM_PROGRAM=iTerm.app` | 새 탭 |
+| Terminal.app | `TERM_PROGRAM=Apple_Terminal` | 새 탭 |
+| tmux | `TMUX` 환경변수 | 새 창 |
+| Kitty | `KITTY_PID` 환경변수 | 새 탭 |
+| WezTerm | `TERM_PROGRAM=WezTerm` | 새 탭 |
+| Fallback | 기타 | TUI 일시중지 후 실행 |
+
+### 기타
+- **한글 키보드 지원** — 두벌식 한글 상태에서도 단축키 동작
+- **10초 자동 갱신** — 세션 변경 실시간 반영
+- **전체 UI 한글화**
+- **도움말** (`?`) — 색상, 아이콘, 단축키 설명
+
+## 설치
+
+Go 1.21+ 필요.
 
 ```bash
-git clone https://github.com/borball/claude-session-manager-tui.git
-cd claude-session-manager-tui
-go build -o claude-session-manager-tui .
+git clone https://github.com/welcomra1n/session-manager-tui.git
+cd session-manager-tui
+go build -o csm .
 ```
 
-Optionally move the binary to your PATH:
+PATH에 추가:
 
 ```bash
-mv claude-session-manager-tui /usr/local/bin/
+cp csm /usr/local/bin/
 ```
 
-## Usage
+## 사용법
 
 ```bash
-claude-session-manager-tui
+csm
 ```
 
-## Key Bindings
+## 단축키
 
-| Key | Action |
-|-----|--------|
-| `Enter` | Resume selected session in a new terminal tab |
-| `s` | Resume selected session in a split pane |
-| `i` | Generate AI summary for selected session |
-| `Tab` | Switch focus between session list and conversation preview |
-| `/` | Open search filter |
-| `Esc` | Clear search filter |
-| `r` | Refresh session list |
-| `q` | Quit |
+| 키 | 기능 |
+|----|------|
+| `Enter` | 세션 열기 (새 터미널 창) |
+| `p` | 미리보기 패널 토글 |
+| `t` | 세션 고정/해제 |
+| `Space` | 다중 선택 |
+| `m` | 세션 이름 변경 |
+| `d` | 선택 세션 삭제 |
+| `D` | 선택된 세션 일괄 삭제 |
+| `o` | 세션 폴더 Finder에서 열기 |
+| `i` | AI 요약 생성 |
+| `/` | 검색 |
+| `r` | 새로고침 |
+| `←` | 그룹 접기 |
+| `→` | 그룹 펼치기 |
+| `?` | 도움말 |
+| `Esc` | 종료 |
 
-## How It Works
+## 개선 예정
 
-1. **Session discovery** — Scans `~/.claude/projects/*/` for `.jsonl` session files
-2. **Path decoding** — Resolves encoded directory names (e.g., `-Users-dev-projects-my-web-app`) back to real filesystem paths by walking the directory tree, correctly handling directory names containing dashes
-3. **Message parsing** — Extracts user/assistant messages from JSONL, strips system metadata and XML tags, filters out slash commands (`/model`, `/resume`) and noise
-4. **Terminal detection** — Checks `TMUX`, `TERM_PROGRAM`, and `KITTY_PID` environment variables to determine the best way to open sessions
-5. **AI summaries** — Uses `claude -p --model haiku --bare --no-session-persistence` to generate concise summaries without creating ghost sessions
+- [ ] `tview.TreeView` 전환 — 진짜 트리 구조로 더 자연스러운 접기/펼치기
+- [ ] 프로젝트별 그룹핑 — Codex 데스크탑처럼 프로젝트 폴더별 세션 묶기
+- [ ] 세션 정렬 옵션 — 이름순/날짜순/만료순 토글
+- [ ] 만료 임박 알림 — D-3 이하 세션 상단 경고 배너
+- [ ] Windows 지원 — Windows Terminal 백엔드
+- [ ] 세션 내보내기 — 대화 내용 마크다운 파일로 저장
+- [ ] 세션 통계 — 총 토큰 사용량, 세션별 메시지 수 차트
+- [ ] 테마 커스터마이징 — 색상/아이콘 설정 파일
 
-## License
+## 라이선스
 
 MIT
