@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -52,9 +53,118 @@ func checkForUpdate() (newVersion, url string, hasUpdate bool) {
 	return "", "", false
 }
 
+func selfUpdate() error {
+	newVer, _, has := checkForUpdate()
+	if !has {
+		fmt.Println("이미 최신 버전입니다:", currentVersion)
+		return nil
+	}
+	fmt.Printf("업데이트 발견: %s → %s\n", currentVersion, newVer)
+
+	// Determine binary name for this platform
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+	binName := fmt.Sprintf("csm-%s-%s", goos, goarch)
+	if goos == "windows" {
+		binName += ".exe"
+	}
+
+	dlURL := fmt.Sprintf("https://github.com/welcomra1n/session-manager-tui/releases/download/v%s/%s", newVer, binName)
+	fmt.Println("다운로드:", dlURL)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(dlURL)
+	if err != nil {
+		return fmt.Errorf("다운로드 실패: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("다운로드 실패: HTTP %d", resp.StatusCode)
+	}
+
+	// Get current executable path
+	execPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("실행 파일 경로 확인 실패: %v", err)
+	}
+	// Resolve symlinks
+	execPath, err = filepath.EvalSymlinks(execPath)
+	if err != nil {
+		return fmt.Errorf("심볼릭 링크 해석 실패: %v", err)
+	}
+
+	// Write to temp file first
+	tmpFile := execPath + ".tmp"
+	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return fmt.Errorf("임시 파일 생성 실패: %v", err)
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmpFile)
+		return fmt.Errorf("쓰기 실패: %v", err)
+	}
+	f.Close()
+
+	// Replace old binary
+	if err := os.Rename(tmpFile, execPath); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("교체 실패: %v", err)
+	}
+
+	fmt.Printf("✅ 업데이트 완료: v%s\n", newVer)
+	return nil
+}
+
+// ── Config file ─────────────────────────────────────────────────────────────
+
+type Config struct {
+	ExpiryDays      int    `json:"expiry_days"`
+	RefreshInterval int    `json:"refresh_interval"`
+	DefaultSort     string `json:"default_sort"`
+	DefaultTerminal string `json:"default_terminal"`
+	CompactMode     bool   `json:"compact_mode"`
+}
+
+func defaultConfig() Config {
+	return Config{
+		ExpiryDays:      30,
+		RefreshInterval: 10,
+		DefaultSort:     "date",
+		DefaultTerminal: "auto",
+		CompactMode:     false,
+	}
+}
+
+func configPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "csm-config.json")
+}
+
+func loadConfig() Config {
+	cfg := defaultConfig()
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return cfg
+	}
+	json.Unmarshal(data, &cfg)
+	if cfg.ExpiryDays <= 0 {
+		cfg.ExpiryDays = 30
+	}
+	if cfg.RefreshInterval <= 0 {
+		cfg.RefreshInterval = 10
+	}
+	return cfg
+}
+
+func saveConfig(cfg Config) {
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	os.WriteFile(configPath(), data, 0644)
+}
+
 // ── Constants ───────────────────────────────────────────────────────────────
 
-const sessionExpiryDays = 30 // sessions older than this are considered expired
+var sessionExpiryDays = 30
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -1529,7 +1639,42 @@ func sessionNodeText(s *Session, searchQuery ...string) string {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
-	cleanOldTrash() // auto-clean trash older than 30 days
+	// CLI flags
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-v":
+			fmt.Printf("csm v%s (%s/%s)\n", currentVersion, runtime.GOOS, runtime.GOARCH)
+			return
+		case "--update", "-u":
+			if err := selfUpdate(); err != nil {
+				fmt.Fprintf(os.Stderr, "업데이트 실패: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "--config":
+			cfg := loadConfig()
+			data, _ := json.MarshalIndent(cfg, "", "  ")
+			fmt.Println("설정 파일:", configPath())
+			fmt.Println(string(data))
+			return
+		case "--help", "-h":
+			fmt.Println("csm — Claude Code + Codex 세션 매니저")
+			fmt.Printf("버전: v%s\n\n", currentVersion)
+			fmt.Println("사용법:")
+			fmt.Println("  csm              TUI 실행")
+			fmt.Println("  csm --version    버전 표시")
+			fmt.Println("  csm --update     최신 버전으로 업데이트")
+			fmt.Println("  csm --config     설정 파일 보기")
+			fmt.Println("  csm --help       도움말")
+			return
+		}
+	}
+
+	// Load config
+	cfg := loadConfig()
+	sessionExpiryDays = cfg.ExpiryDays
+
+	cleanOldTrash()
 	fmt.Print("세션 불러오는 중...")
 	sessions := discoverSessions()
 	fmt.Print("\r\033[2K")
@@ -1542,7 +1687,7 @@ func main() {
 	localPins := loadPins()
 	localUnpins := loadUnpins()
 	projectAliases := loadProjectAliases()
-	compactMode := false
+	compactMode := cfg.CompactMode
 	var updateInfo string // set by background check
 
 	// ── Widgets ──
@@ -1618,6 +1763,12 @@ func main() {
 		SortByExpiry
 	)
 	sortMode := SortByDate
+	switch cfg.DefaultSort {
+	case "name":
+		sortMode = SortByName
+	case "expiry":
+		sortMode = SortByExpiry
+	}
 	sortLabels := map[SortMode]string{
 		SortByDate:   "날짜순",
 		SortByName:   "이름순",
@@ -2869,6 +3020,25 @@ func main() {
 						statusBar.SetText("[green]컴팩트 모드 OFF[-]")
 					}
 					return nil
+
+				case 'u': // Self-update
+					if updateInfo == "" {
+						statusBar.SetText("[yellow]업데이트 확인 중...[-]")
+						go func() {
+							newVer, _, has := checkForUpdate()
+							app.QueueUpdateDraw(func() {
+								if !has {
+									statusBar.SetText("[green]이미 최신 버전입니다 (v" + currentVersion + ")[-]")
+								} else {
+									updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
+									statusBar.SetText(fmt.Sprintf("[yellow]새 버전 %s 발견. 터미널에서 csm --update 실행[-]", newVer))
+								}
+							})
+						}()
+					} else {
+						statusBar.SetText("[yellow]터미널에서 csm --update 실행하세요[-]")
+					}
+					return nil
 				}
 			}
 		}
@@ -2885,9 +3055,9 @@ func main() {
 		}
 	}()
 
-	// Background polling: auto-refresh every 10 seconds
+	// Background polling
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(time.Duration(cfg.RefreshInterval) * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			fresh := discoverSessions()
