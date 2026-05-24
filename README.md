@@ -144,15 +144,47 @@ csm
 | `~/.claude/session-unpins.json` | 고정 해제 목록 |
 | `~/.claude/session-trash/` | 휴지통 (삭제된 세션) |
 
+## 원격 접속 (Tailscale / SSH)
+
+핸드폰이나 다른 기기에서 세션 관리 가능:
+
+```bash
+# Tailscale 네트워크를 통해 Mac에 SSH 접속
+ssh user@your-mac.tailnet-name.ts.net
+
+# csm 실행
+csm
+```
+
+추천 모바일 SSH 앱: **Termius**, **Blink Shell**, **a-Shell**
+
+## 크로스 플랫폼 빌드
+
+```bash
+make build-all
+```
+
+`dist/` 폴더에 생성:
+- `csm-darwin-arm64` (Apple Silicon Mac)
+- `csm-darwin-amd64` (Intel Mac)
+- `csm-linux-amd64`
+- `csm-linux-arm64`
+- `csm-windows-amd64.exe`
+
+## Homebrew 설치 (예정)
+
+```bash
+brew tap welcomra1n/tap
+brew install csm
+```
+
 ## 개선 예정
 
-- [ ] Windows 지원 — Windows Terminal 백엔드
 - [ ] 세션 태그 — #작업, #개인 등 태그로 분류
 - [ ] 세션 메모 — 각 세션에 한 줄 메모 추가
 - [ ] 테마 설정 — `~/.claude/csm-theme.json`으로 색상 커스텀
 - [ ] 설정 파일 — `~/.claude/csm-config.toml` (정렬 기본값, 만료 기준일 등)
 - [ ] Gemini CLI 지원 — 3번째 provider
-- [ ] Homebrew formula — `brew install csm`
 - [ ] 세션 복제 — 기존 세션 fork해서 새 세션
 - [ ] 자동 업데이트 알림
 

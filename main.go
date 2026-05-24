@@ -662,6 +662,17 @@ func deleteSession(s *Session) error {
 	return nil
 }
 
+func cleanOldTrash() {
+	items := listTrash()
+	for _, item := range items {
+		if t, err := time.Parse(time.RFC3339, item["deletedAt"]); err == nil {
+			if time.Since(t) > 30*24*time.Hour {
+				permanentDeleteTrash(item)
+			}
+		}
+	}
+}
+
 func listTrash() []map[string]string {
 	trash := trashDir()
 	entries, err := os.ReadDir(trash)
@@ -1367,6 +1378,7 @@ func sessionNodeText(s *Session, searchQuery ...string) string {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
+	cleanOldTrash() // auto-clean trash older than 30 days
 	fmt.Print("세션 불러오는 중...")
 	sessions := discoverSessions()
 	fmt.Print("\r\033[2K")
@@ -1709,6 +1721,16 @@ func main() {
 					}
 					projectMap[s.ProjectName] = append(projectMap[s.ProjectName], s)
 				}
+				// Sort: 미분류 always last
+				sort.SliceStable(projectOrder, func(i, j int) bool {
+					if projectOrder[i] == "미분류" {
+						return false
+					}
+					if projectOrder[j] == "미분류" {
+						return true
+					}
+					return false // keep original order
+				})
 				for _, projName := range projectOrder {
 					projSessions := projectMap[projName]
 					displayProj := projName
@@ -1738,6 +1760,14 @@ func main() {
 			}
 		}
 
+		if len(claudeSessions) == 0 && len(codexSessions) == 0 && filter == "" {
+			emptyNode := tview.NewTreeNode("[#888888]세션이 없습니다[-]")
+			emptyNode.SetSelectable(false)
+			root.AddChild(emptyNode)
+			guideNode := tview.NewTreeNode("[#888888]터미널에서 [white]claude[-][#888888] 또는 [white]codex[-][#888888]를 실행하면 세션이 생성됩니다[-]")
+			guideNode.SetSelectable(false)
+			root.AddChild(guideNode)
+		}
 		addProviderGroup("Claude", "[#FF8C00]", "\xf0\x9f\xa7\xa0", claudeSessions, "new-claude")
 		addProviderGroup("Codex", "[#4A9EFF]", "\xf0\x9f\xa4\x96", codexSessions, "new-codex")
 

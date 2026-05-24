@@ -1,0 +1,17 @@
+.PHONY: build build-all clean install
+
+build:
+	go build -o csm .
+
+build-all:
+	GOOS=darwin GOARCH=arm64 go build -o dist/csm-darwin-arm64 .
+	GOOS=darwin GOARCH=amd64 go build -o dist/csm-darwin-amd64 .
+	GOOS=linux GOARCH=amd64 go build -o dist/csm-linux-amd64 .
+	GOOS=linux GOARCH=arm64 go build -o dist/csm-linux-arm64 .
+	GOOS=windows GOARCH=amd64 go build -o dist/csm-windows-amd64.exe .
+
+clean:
+	rm -rf csm dist/
+
+install: build
+	cp csm /usr/local/bin/csm
