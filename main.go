@@ -128,10 +128,20 @@ func toEngKey(r rune) rune {
 	return r
 }
 
-// padRight pads a string to n visible characters (ignoring tview color tags)
-func padRight(s string, n int) string {
-	// Count visible length (strip tview tags)
-	visible := 0
+// isWide returns true if rune takes 2 cells in terminal (CJK, emoji, etc.)
+func isWide(r rune) bool {
+	return (r >= 0x1100 && r <= 0x115F) || // Hangul Jamo
+		(r >= 0x2E80 && r <= 0x9FFF) || // CJK
+		(r >= 0xAC00 && r <= 0xD7AF) || // Hangul Syllables
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK Compatibility
+		(r >= 0xFE30 && r <= 0xFE6F) || // CJK Forms
+		(r >= 0xFF01 && r <= 0xFF60) || // Fullwidth
+		(r >= 0x1F000 && r <= 0x1FFFF) // Emoji
+}
+
+// visibleWidth counts display width (ignoring tview color tags, CJK=2)
+func visibleWidth(s string) int {
+	w := 0
 	inTag := false
 	for _, r := range s {
 		if r == '[' {
@@ -144,12 +154,53 @@ func padRight(s string, n int) string {
 			}
 			continue
 		}
-		visible++
+		if isWide(r) {
+			w += 2
+		} else {
+			w++
+		}
 	}
-	if visible >= n {
-		return s
+	return w
+}
+
+// padRight pads a string to n visible cells, truncating if too long
+func padRight(s string, n int) string {
+	w := visibleWidth(s)
+	if w > n {
+		// Truncate
+		cur := 0
+		inTag := false
+		var result strings.Builder
+		for _, r := range s {
+			if r == '[' {
+				inTag = true
+				result.WriteRune(r)
+				continue
+			}
+			if inTag {
+				result.WriteRune(r)
+				if r == ']' {
+					inTag = false
+				}
+				continue
+			}
+			rw := 1
+			if isWide(r) {
+				rw = 2
+			}
+			if cur+rw > n-1 {
+				result.WriteRune('…')
+				return result.String()
+			}
+			result.WriteRune(r)
+			cur += rw
+		}
+		return result.String()
 	}
-	return s + strings.Repeat(" ", n-visible)
+	if w < n {
+		return s + strings.Repeat(" ", n-w)
+	}
+	return s
 }
 
 // isSessionActive checks if a session file was modified very recently (likely in use)
@@ -755,7 +806,20 @@ func loadSession(path string) *Session {
 
 	for sc.Scan() {
 		var raw rawLine
-		if json.Unmarshal(sc.Bytes(), &raw) != nil || (raw.Type != "user" && raw.Type != "assistant") {
+		if json.Unmarshal(sc.Bytes(), &raw) != nil {
+			continue
+		}
+		// Read custom title from /rename command
+		if raw.Type == "custom-title" {
+			var ct struct {
+				CustomTitle string `json:"customTitle"`
+			}
+			if json.Unmarshal(sc.Bytes(), &ct) == nil && ct.CustomTitle != "" {
+				sess.Alias = ct.CustomTitle
+			}
+			continue
+		}
+		if raw.Type != "user" && raw.Type != "assistant" {
 			continue
 		}
 		var env msgEnvelope
@@ -1142,6 +1206,9 @@ func main() {
 	var togglePreview func()
 	var filteredIdx []int
 	currentFilter := ""
+	collapsed := make(map[string]bool) // "claude", "codex" group collapse state
+	// Track which group each list item belongs to
+	var itemGroup []string
 
 	// ── Session display ──
 
@@ -1250,6 +1317,7 @@ func main() {
 	populateList := func(filter string) {
 		sessionList.Clear()
 		filteredIdx = nil
+		itemGroup = nil
 		lowerFilter := strings.ToLower(filter)
 
 		var claudeSessions, codexSessions []int
@@ -1268,13 +1336,14 @@ func main() {
 		}
 
 
-		addSeparator := func(title string) {
+		addSep := func(title string, group string) {
 			sessionList.AddItem(fmt.Sprintf("[#444444]── %s ──[-]", title), "", 0, nil)
 			filteredIdx = append(filteredIdx, -1)
+			itemGroup = append(itemGroup, group)
 		}
 
 		// Tree item with prefix
-		addTreeItem := func(si int, isLast bool) {
+		addTreeItem := func(si int, isLast bool, group string) {
 			s := sessions[si]
 			check := ""
 			if s.Selected {
@@ -1286,10 +1355,6 @@ func main() {
 			}
 			if title == "" {
 				title = fmt.Sprintf("%d개 메시지", s.MessageCount)
-			}
-			provColor := "[#FF8C00]"
-			if s.Provider == ProviderCodex {
-				provColor = "[#4A9EFF]"
 			}
 			epIco := entrypointIcon(s.Entrypoint)
 			if s.Provider == ProviderCodex {
@@ -1303,13 +1368,9 @@ func main() {
 			} else if time.Since(s.ModTime) < 7*24*time.Hour {
 				dateColor = "[#00ff00]"
 			}
-			provIcon := s.Provider.Icon()
+			activeIcon := " "
 			if s.Active {
-				provIcon = "\xe2\x96\xb6"
-			}
-			pinTag := " "
-			if s.Pinned {
-				pinTag = "\xf0\x9f\x93\x8c"
+				activeIcon = "[lime]\xe2\x96\xb6[-]"
 			}
 
 			branch := "[#444444]\xe2\x94\x9c[-]" // ├
@@ -1317,20 +1378,21 @@ func main() {
 				branch = "[#444444]\xe2\x94\x94[-]" // └
 			}
 
-			col1 := fmt.Sprintf("%s%s%s[-]%s", check, provColor, provIcon, pinTag)
-			col2 := fmt.Sprintf("%-4s", epIco)
-			col3 := padRight(expiryLabel(s), 7)
-			col4 := fmt.Sprintf("%s%-12s[-]", dateColor, s.ModTime.Format("01/02 15:04"))
-			col5 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(s.ProjectName)), 15)
-			col6 := fmt.Sprintf("[white]%s[-]", esc(title))
-			label := fmt.Sprintf("   %s %s %s%s %s %s %s", branch, col1, col2, col3, col4, col5, col6)
+			col1 := fmt.Sprintf("%s%s%s", check, activeIcon, branch)
+			col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
+			col3 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(s.ProjectName)), 20)
+			col4 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
+			col5 := padRight(fmt.Sprintf("[#666666]%s[-]", epIco), 4)
+			col6 := padRight(fmt.Sprintf("[#666666]%s[-]", expiryLabel(s)), 6)
+			label := fmt.Sprintf("   %s %s  %s  %s  %s  %s", col1, col2, col3, col4, col5, col6)
 			sessionList.AddItem(label, "", 0, nil)
 			filteredIdx = append(filteredIdx, si)
+			itemGroup = append(itemGroup, group)
 		}
 
-		addTreeItems := func(items []int) {
+		addTreeItems := func(items []int, group string) {
 			for i, si := range items {
-				addTreeItem(si, i == len(items)-1)
+				addTreeItem(si, i == len(items)-1, group)
 			}
 		}
 
@@ -1339,6 +1401,7 @@ func main() {
 			if len(items) == 0 {
 				return
 			}
+			groupKey := strings.ToLower(provName)
 			var pinned, normal []int
 			for _, si := range items {
 				if sessions[si].Pinned {
@@ -1348,25 +1411,42 @@ func main() {
 				}
 			}
 
-			// Provider header
-			addSeparator(fmt.Sprintf("%s%s %s[-][#444444] (%d)", provColor, icon, provName, len(items)))
+			// Provider header (no toggle)
+			addSep(fmt.Sprintf("%s%s %s[-][#444444] (%d)", provColor, provName, icon, len(items)), groupKey)
 
 			// New session
 			sessionList.AddItem(fmt.Sprintf("   %s+ 새 %s 세션[-]", provColor, provName), "", 0, nil)
 			filteredIdx = append(filteredIdx, newIdx)
+			itemGroup = append(itemGroup, groupKey)
 
 			// Pinned
 			if len(pinned) > 0 {
-				sessionList.AddItem("   [#444444]\xf0\x9f\x93\x8c 고정[-]", "", 0, nil)
+				pinKey := groupKey + "-pin"
+				pinArrow := "\xe2\x96\xbc" // ▼
+				if collapsed[pinKey] {
+					pinArrow = "\xe2\x96\xb6" // ▶
+				}
+				sessionList.AddItem(fmt.Sprintf("   [#444444]%s 고정 \xf0\x9f\x93\x8c (%d)[-]", pinArrow, len(pinned)), "", 0, nil)
 				filteredIdx = append(filteredIdx, -1)
-				addTreeItems(pinned)
+				itemGroup = append(itemGroup, pinKey)
+				if !collapsed[pinKey] {
+					addTreeItems(pinned, pinKey)
+				}
 			}
 
 			// Normal
 			if len(normal) > 0 {
-				sessionList.AddItem("   [#444444]세션[-]", "", 0, nil)
+				normKey := groupKey + "-normal"
+				normArrow := "\xe2\x96\xbc" // ▼
+				if collapsed[normKey] {
+					normArrow = "\xe2\x96\xb6" // ▶
+				}
+				sessionList.AddItem(fmt.Sprintf("   [#444444]%s 세션 (%d)[-]", normArrow, len(normal)), "", 0, nil)
 				filteredIdx = append(filteredIdx, -1)
-				addTreeItems(normal)
+				itemGroup = append(itemGroup, normKey)
+				if !collapsed[normKey] {
+					addTreeItems(normal, normKey)
+				}
 			}
 		}
 
@@ -1375,6 +1455,7 @@ func main() {
 		if len(claudeSessions) > 0 && len(codexSessions) > 0 {
 			sessionList.AddItem("", "", 0, nil)
 			filteredIdx = append(filteredIdx, -1)
+			itemGroup = append(itemGroup, "")
 		}
 
 		addProviderGroup("Codex", "[#4A9EFF]", "\xf0\x9f\xa4\x96", codexSessions, -3)
@@ -1589,6 +1670,26 @@ func main() {
 		}
 
 		switch ev.Key() {
+		case tcell.KeyLeft: // Collapse group
+			idx := sessionList.GetCurrentItem()
+			if idx >= 0 && idx < len(itemGroup) && itemGroup[idx] != "" {
+				grp := itemGroup[idx]
+				if !collapsed[grp] {
+					collapsed[grp] = true
+					populateList(currentFilter)
+				}
+			}
+			return nil
+		case tcell.KeyRight: // Expand group
+			idx := sessionList.GetCurrentItem()
+			if idx >= 0 && idx < len(itemGroup) && itemGroup[idx] != "" {
+				grp := itemGroup[idx]
+				if collapsed[grp] {
+					collapsed[grp] = false
+					populateList(currentFilter)
+				}
+			}
+			return nil
 		case tcell.KeyTab:
 			if previewOpen {
 				focusIdx = (focusIdx + 1) % len(focusables)
@@ -1631,8 +1732,8 @@ func main() {
 							"  [#666666]회색[-]   7일 이상\n" +
 							"  [#FF4444]빨강[-]   만료 (30일+)\n\n" +
 							"[white]아이콘:[-]\n" +
-							"  [#FF8C00]\xe2\x9c\xb4[-]  Claude 세션\n" +
-							"  [#4A9EFF]\xe2\x9c\xa6[-]  Codex 세션\n" +
+							"  Claude [#FF8C00]\xf0\x9f\xa7\xa0[-]  세션\n" +
+							"  Codex [#4A9EFF]\xf0\x9f\xa4\x96[-]  세션\n" +
 							"  \xe2\x96\xb6  활성 (사용 중)\n\n" +
 							"[white]열 구성:[-]  아이콘 | CLI/DSK/WEB | D-day | 날짜 | 프로젝트 | 제목\n\n" +
 							"[white]D-day:[-]  세션 만료까지 남은 일수 (기준 30일)\n" +
