@@ -1128,6 +1128,70 @@ func generateSummary(s *Session) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// ── Helper: get session from tree node ──────────────────────────────────────
+
+func nodeSession(node *tview.TreeNode) *Session {
+	if node == nil || node.GetReference() == nil {
+		return nil
+	}
+	s, ok := node.GetReference().(*Session)
+	if !ok {
+		return nil
+	}
+	return s
+}
+
+func nodeRefStr(node *tview.TreeNode) string {
+	if node == nil || node.GetReference() == nil {
+		return ""
+	}
+	s, ok := node.GetReference().(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+// ── Session node text formatting ────────────────────────────────────────────
+
+func sessionNodeText(s *Session) string {
+	check := " "
+	if s.Selected {
+		check = "\xe2\x9c\x93" // ✓
+	}
+	title := s.Alias
+	if title == "" {
+		title = trunc(s.FirstUserMsg, 40)
+	}
+	if title == "" {
+		title = fmt.Sprintf("%d개 메시지", s.MessageCount)
+	}
+	epIco := entrypointIcon(s.Entrypoint)
+	if s.Provider == ProviderCodex {
+		epIco = "DSK"
+	}
+	dateColor := "[#666666]"
+	if daysUntilExpiry(s) < 0 {
+		dateColor = "[#FF4444]"
+	} else if time.Since(s.ModTime) < 2*time.Minute {
+		dateColor = "[#00BFFF]"
+	} else if time.Since(s.ModTime) < 7*24*time.Hour {
+		dateColor = "[#00ff00]"
+	}
+	activeIcon := " "
+	if s.Active {
+		activeIcon = "[lime]\xe2\x96\xb6[-]"
+	}
+
+	col1 := fmt.Sprintf("%s%s", check, activeIcon)
+	col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
+	col3 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(s.ProjectName)), 20)
+	col4 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
+	col5 := padRight(fmt.Sprintf("[#666666]%s[-]", epIco), 4)
+	col6 := padRight(fmt.Sprintf("[#666666]%s[-]", expiryLabel(s)), 6)
+	return fmt.Sprintf("%s %s  %s  %s  %s  %s", col1, col2, col3, col4, col5, col6)
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -1143,14 +1207,14 @@ func main() {
 
 	// ── Widgets ──
 
-	sessionList := tview.NewList().
-		ShowSecondaryText(false).
-		SetHighlightFullLine(true).
-		SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorDarkSlateGray).Foreground(tcell.ColorWhite))
-	sessionList.SetBorder(true).
+	selectedStyle := tcell.StyleDefault.Background(tcell.ColorDarkSlateGray).Foreground(tcell.ColorWhite)
+	tree := tview.NewTreeView()
+	tree.SetBorder(true).
 		SetTitle(" 세션 목록 ").
 		SetTitleAlign(tview.AlignLeft).
 		SetBorderColor(tcell.ColorGreen)
+	tree.SetGraphics(false)
+	tree.SetTopLevel(1) // hide root
 
 	infoView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1188,7 +1252,7 @@ func main() {
 	// ── Layout ──
 
 	leftPane := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(sessionList, 0, 1, true)
+		AddItem(tree, 0, 1, true)
 
 	rightPane := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(infoView, 0, 2, false).
@@ -1204,19 +1268,14 @@ func main() {
 
 	previewOpen := false
 	var togglePreview func()
-	var filteredIdx []int
 	currentFilter := ""
-	collapsed := make(map[string]bool) // "claude", "codex" group collapse state
-	// Track which group each list item belongs to
-	var itemGroup []string
 
 	// ── Session display ──
 
-	showSessionInfo := func(idx int) {
-		if idx < 0 || idx >= len(sessions) {
+	showSessionInfo := func(s *Session) {
+		if s == nil {
 			return
 		}
-		s := sessions[idx]
 
 		var b strings.Builder
 		epInfo := entrypointLabel(s.Entrypoint)
@@ -1284,18 +1343,18 @@ func main() {
 		if previewOpen {
 			mainBody.RemoveItem(rightPane)
 			previewOpen = false
-			app.SetFocus(sessionList)
+			app.SetFocus(tree)
 		} else {
 			mainBody.AddItem(rightPane, 0, 1, false)
 			previewOpen = true
-			idx := sessionList.GetCurrentItem()
-			if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
-				showSessionInfo(filteredIdx[idx])
+			cur := tree.GetCurrentNode()
+			if s := nodeSession(cur); s != nil {
+				showSessionInfo(s)
 			}
 		}
 	}
 
-	// ── Filtered session list ──
+	// ── Populate tree ──
 
 	defaultStatus := func() string {
 		selected := 0
@@ -1314,14 +1373,24 @@ func main() {
 		)
 	}
 
-	populateList := func(filter string) {
-		sessionList.Clear()
-		filteredIdx = nil
-		itemGroup = nil
+	// Track the previously selected session ID to restore after rebuild
+	var lastSelectedID string
+
+	populateTree := func(filter string) {
+		// Remember currently selected session
+		if cur := tree.GetCurrentNode(); cur != nil {
+			if s := nodeSession(cur); s != nil {
+				lastSelectedID = s.ID
+			}
+		}
+
+		root := tview.NewTreeNode("root")
+		tree.SetRoot(root)
+
 		lowerFilter := strings.ToLower(filter)
 
-		var claudeSessions, codexSessions []int
-		for i, s := range sessions {
+		var claudeSessions, codexSessions []*Session
+		for _, s := range sessions {
 			if lowerFilter != "" {
 				haystack := strings.ToLower(s.ProjectName + " " + s.Alias + " " + s.FirstUserMsg + " " + s.LastUserMsg + " " + s.GitBranch)
 				if !strings.Contains(haystack, lowerFilter) {
@@ -1329,158 +1398,126 @@ func main() {
 				}
 			}
 			if s.Provider == ProviderCodex {
-				codexSessions = append(codexSessions, i)
+				codexSessions = append(codexSessions, s)
 			} else {
-				claudeSessions = append(claudeSessions, i)
+				claudeSessions = append(claudeSessions, s)
 			}
 		}
 
+		var firstSessionNode *tview.TreeNode
+		var restoreNode *tview.TreeNode
 
-		addSep := func(title string, group string) {
-			sessionList.AddItem(fmt.Sprintf("[#444444]── %s ──[-]", title), "", 0, nil)
-			filteredIdx = append(filteredIdx, -1)
-			itemGroup = append(itemGroup, group)
-		}
-
-		// Tree item with prefix
-		addTreeItem := func(si int, isLast bool, group string) {
-			s := sessions[si]
-			check := ""
-			if s.Selected {
-				check = "\xe2\x9c\x93" // ✓
-			}
-			title := s.Alias
-			if title == "" {
-				title = trunc(s.FirstUserMsg, 40)
-			}
-			if title == "" {
-				title = fmt.Sprintf("%d개 메시지", s.MessageCount)
-			}
-			epIco := entrypointIcon(s.Entrypoint)
-			if s.Provider == ProviderCodex {
-				epIco = "DSK"
-			}
-			dateColor := "[#666666]"
-			if daysUntilExpiry(s) < 0 {
-				dateColor = "[#FF4444]"
-			} else if time.Since(s.ModTime) < 2*time.Minute {
-				dateColor = "[#00BFFF]"
-			} else if time.Since(s.ModTime) < 7*24*time.Hour {
-				dateColor = "[#00ff00]"
-			}
-			activeIcon := " "
-			if s.Active {
-				activeIcon = "[lime]\xe2\x96\xb6[-]"
-			}
-
-			branch := "[#444444]\xe2\x94\x9c[-]" // ├
-			if isLast {
-				branch = "[#444444]\xe2\x94\x94[-]" // └
-			}
-
-			col1 := fmt.Sprintf("%s%s%s", check, activeIcon, branch)
-			col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
-			col3 := padRight(fmt.Sprintf("[#666666]%s[-]", esc(s.ProjectName)), 20)
-			col4 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
-			col5 := padRight(fmt.Sprintf("[#666666]%s[-]", epIco), 4)
-			col6 := padRight(fmt.Sprintf("[#666666]%s[-]", expiryLabel(s)), 6)
-			label := fmt.Sprintf("   %s %s  %s  %s  %s  %s", col1, col2, col3, col4, col5, col6)
-			sessionList.AddItem(label, "", 0, nil)
-			filteredIdx = append(filteredIdx, si)
-			itemGroup = append(itemGroup, group)
-		}
-
-		addTreeItems := func(items []int, group string) {
-			for i, si := range items {
-				addTreeItem(si, i == len(items)-1, group)
-			}
-		}
-
-		// Split each provider into pinned and unpinned
-		addProviderGroup := func(provName string, provColor string, icon string, items []int, newIdx int) {
+		addProviderGroup := func(provName string, provColor string, icon string, items []*Session, newRef string) {
 			if len(items) == 0 {
 				return
 			}
-			groupKey := strings.ToLower(provName)
-			var pinned, normal []int
-			for _, si := range items {
-				if sessions[si].Pinned {
-					pinned = append(pinned, si)
+			// Provider header node
+			provNode := tview.NewTreeNode(fmt.Sprintf("%s%s %s[-] (%d)", provColor, provName, icon, len(items)))
+			provNode.SetSelectable(false)
+			provNode.SetExpanded(true)
+			root.AddChild(provNode)
+
+			// "+ New session" node
+			newNode := tview.NewTreeNode(fmt.Sprintf("  %s+ 새 %s 세션[-]", provColor, provName))
+			newNode.SetReference(newRef)
+			newNode.SetSelectable(true)
+			newNode.SetSelectedTextStyle(selectedStyle)
+			provNode.AddChild(newNode)
+			if firstSessionNode == nil {
+				firstSessionNode = newNode
+			}
+
+			// Split into pinned / normal
+			var pinned, normal []*Session
+			for _, s := range items {
+				if s.Pinned {
+					pinned = append(pinned, s)
 				} else {
-					normal = append(normal, si)
+					normal = append(normal, s)
 				}
 			}
 
-			// Provider header (no toggle)
-			addSep(fmt.Sprintf("%s%s %s[-][#444444] (%d)", provColor, provName, icon, len(items)), groupKey)
-
-			// New session
-			sessionList.AddItem(fmt.Sprintf("   %s+ 새 %s 세션[-]", provColor, provName), "", 0, nil)
-			filteredIdx = append(filteredIdx, newIdx)
-			itemGroup = append(itemGroup, groupKey)
-
-			// Pinned
+			// Pinned group
 			if len(pinned) > 0 {
-				pinKey := groupKey + "-pin"
-				pinArrow := "\xe2\x96\xbc" // ▼
-				if collapsed[pinKey] {
-					pinArrow = "\xe2\x96\xb6" // ▶
-				}
-				sessionList.AddItem(fmt.Sprintf("   [#444444]%s 고정 \xf0\x9f\x93\x8c (%d)[-]", pinArrow, len(pinned)), "", 0, nil)
-				filteredIdx = append(filteredIdx, -1)
-				itemGroup = append(itemGroup, pinKey)
-				if !collapsed[pinKey] {
-					addTreeItems(pinned, pinKey)
+				pinGroupNode := tview.NewTreeNode(fmt.Sprintf("[#444444]고정 \xf0\x9f\x93\x8c (%d)[-]", len(pinned)))
+				pinGroupNode.SetSelectable(true)
+				pinGroupNode.SetExpanded(true)
+				pinGroupNode.SetSelectedTextStyle(selectedStyle)
+				provNode.AddChild(pinGroupNode)
+				for _, s := range pinned {
+					sNode := tview.NewTreeNode(sessionNodeText(s))
+					sNode.SetReference(s)
+					sNode.SetSelectable(true)
+					sNode.SetSelectedTextStyle(selectedStyle)
+					pinGroupNode.AddChild(sNode)
+					if firstSessionNode == nil {
+						firstSessionNode = sNode
+					}
+					if lastSelectedID != "" && s.ID == lastSelectedID {
+						restoreNode = sNode
+					}
 				}
 			}
 
-			// Normal
+			// Normal group
 			if len(normal) > 0 {
-				normKey := groupKey + "-normal"
-				normArrow := "\xe2\x96\xbc" // ▼
-				if collapsed[normKey] {
-					normArrow = "\xe2\x96\xb6" // ▶
-				}
-				sessionList.AddItem(fmt.Sprintf("   [#444444]%s 세션 (%d)[-]", normArrow, len(normal)), "", 0, nil)
-				filteredIdx = append(filteredIdx, -1)
-				itemGroup = append(itemGroup, normKey)
-				if !collapsed[normKey] {
-					addTreeItems(normal, normKey)
+				normGroupNode := tview.NewTreeNode(fmt.Sprintf("[#444444]세션 (%d)[-]", len(normal)))
+				normGroupNode.SetSelectable(true)
+				normGroupNode.SetExpanded(true)
+				normGroupNode.SetSelectedTextStyle(selectedStyle)
+				provNode.AddChild(normGroupNode)
+				for _, s := range normal {
+					sNode := tview.NewTreeNode(sessionNodeText(s))
+					sNode.SetReference(s)
+					sNode.SetSelectable(true)
+					sNode.SetSelectedTextStyle(selectedStyle)
+					normGroupNode.AddChild(sNode)
+					if firstSessionNode == nil {
+						firstSessionNode = sNode
+					}
+					if lastSelectedID != "" && s.ID == lastSelectedID {
+						restoreNode = sNode
+					}
 				}
 			}
 		}
 
-		addProviderGroup("Claude", "[#FF8C00]", "\xf0\x9f\xa7\xa0", claudeSessions, -2)
+		addProviderGroup("Claude", "[#FF8C00]", "\xf0\x9f\xa7\xa0", claudeSessions, "new-claude")
+		addProviderGroup("Codex", "[#4A9EFF]", "\xf0\x9f\xa4\x96", codexSessions, "new-codex")
 
-		if len(claudeSessions) > 0 && len(codexSessions) > 0 {
-			sessionList.AddItem("", "", 0, nil)
-			filteredIdx = append(filteredIdx, -1)
-			itemGroup = append(itemGroup, "")
-		}
-
-		addProviderGroup("Codex", "[#4A9EFF]", "\xf0\x9f\xa4\x96", codexSessions, -3)
-		if len(filteredIdx) > 0 {
-			sessionList.SetCurrentItem(0)
-			showSessionInfo(filteredIdx[0])
-		}
-		if len(filteredIdx) == 0 {
+		// Restore selection or pick first
+		if restoreNode != nil {
+			tree.SetCurrentNode(restoreNode)
+			if s := nodeSession(restoreNode); s != nil && previewOpen {
+				showSessionInfo(s)
+			}
+		} else if firstSessionNode != nil {
+			tree.SetCurrentNode(firstSessionNode)
+			if s := nodeSession(firstSessionNode); s != nil && previewOpen {
+				showSessionInfo(s)
+			}
+		} else {
 			infoView.SetText("[gray]검색 결과 없음[-]")
 			convView.SetText("")
 		}
+
 		if filter == "" {
 			statusBar.SetText(defaultStatus())
 		} else {
+			total := len(claudeSessions) + len(codexSessions)
 			statusBar.SetText(fmt.Sprintf(
 				"[green]%d/%d개 세션[-] | [yellow]Esc[-] 취소 | [yellow]Enter[-] 열기 | [yellow]i[-] 요약",
-				len(filteredIdx), len(sessions),
+				total, len(sessions),
 			))
 		}
 	}
-	populateList("")
+	populateTree("")
 
-	sessionList.SetChangedFunc(func(idx int, _, _ string, _ rune) {
-		if previewOpen && idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
-			showSessionInfo(filteredIdx[idx])
+	tree.SetChangedFunc(func(node *tview.TreeNode) {
+		if previewOpen {
+			if s := nodeSession(node); s != nil {
+				showSessionInfo(s)
+			}
 		}
 	})
 
@@ -1507,30 +1544,32 @@ func main() {
 				app.QueueUpdateDraw(func() {
 					sessions = fresh
 					aliases = loadAliases()
-					populateList(currentFilter)
+					populateTree(currentFilter)
 				})
 			}()
 		}
 	}
 
-	openSession := func(idx int, inTab bool) {
-		if idx < 0 || idx >= len(filteredIdx) {
+	openSessionFromNode := func(node *tview.TreeNode, inTab bool) {
+		if node == nil {
 			return
 		}
-		fi := filteredIdx[idx]
-		// Handle "New Session" items
-		if fi == -2 {
+		// Check for "new session" references
+		ref := nodeRefStr(node)
+		if ref == "new-claude" {
 			newSession(ProviderClaude)
 			return
 		}
-		if fi == -3 {
+		if ref == "new-codex" {
 			newSession(ProviderCodex)
 			return
 		}
-		if fi < 0 {
+		s := nodeSession(node)
+		if s == nil {
+			// Toggle expand/collapse for group nodes
+			node.SetExpanded(!node.IsExpanded())
 			return
 		}
-		s := sessions[filteredIdx[idx]]
 		var resumeCmd string
 		if s.Provider == ProviderCodex {
 			resumeCmd = fmt.Sprintf("codex resume %s --sandbox danger-full-access", s.ID)
@@ -1561,7 +1600,7 @@ func main() {
 				app.QueueUpdateDraw(func() {
 					sessions = fresh
 					aliases = loadAliases()
-					populateList(currentFilter)
+					populateTree(currentFilter)
 				})
 			}
 			go func() {
@@ -1576,17 +1615,16 @@ func main() {
 	}
 
 	requestSummary := func() {
-		idx := sessionList.GetCurrentItem()
-		if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+		cur := tree.GetCurrentNode()
+		s := nodeSession(cur)
+		if s == nil {
 			return
 		}
-		s := sessions[filteredIdx[idx]]
 		if _, ok := summaryCache[s.ID]; ok {
-			showSessionInfo(filteredIdx[idx])
+			showSessionInfo(s)
 			return
 		}
 		sessionID := s.ID
-		sessionIdx := filteredIdx[idx]
 		statusBar.SetText(fmt.Sprintf("[yellow]%s 요약 생성 중...[-]", esc(s.ProjectName)))
 		infoView.SetText(infoView.GetText(false) + "\n[yellow]AI 요약 생성 중...[-]")
 		go func() {
@@ -1597,31 +1635,31 @@ func main() {
 					return
 				}
 				summaryCache[sessionID] = summary
-				curIdx := sessionList.GetCurrentItem()
-				if curIdx >= 0 && curIdx < len(filteredIdx) && filteredIdx[curIdx] == sessionIdx {
-					showSessionInfo(sessionIdx)
+				curNode := tree.GetCurrentNode()
+				if cs := nodeSession(curNode); cs != nil && cs.ID == sessionID {
+					showSessionInfo(cs)
 				}
 				statusBar.SetText(fmt.Sprintf("[green]요약 완료: %s[-]", esc(s.ProjectName)))
 			})
 		}()
 	}
 
-	sessionList.SetSelectedFunc(func(idx int, _, _ string, _ rune) {
-		openSession(idx, true)
+	tree.SetSelectedFunc(func(node *tview.TreeNode) {
+		openSessionFromNode(node, true)
 	})
 
 	// ── Focus & search ──
 
-	focusables := []tview.Primitive{sessionList, convView}
+	focusables := []tview.Primitive{tree, convView}
 	focusIdx := 0
 	searching := false
 
 	updateBorders := func() {
 		if focusIdx == 0 {
-			sessionList.SetBorderColor(tcell.ColorGreen)
+			tree.SetBorderColor(tcell.ColorGreen)
 			convView.SetBorderColor(tcell.ColorDodgerBlue)
 		} else {
-			sessionList.SetBorderColor(tcell.ColorDodgerBlue)
+			tree.SetBorderColor(tcell.ColorDodgerBlue)
 			convView.SetBorderColor(tcell.ColorGreen)
 		}
 	}
@@ -1630,19 +1668,19 @@ func main() {
 		searching = true
 		leftPane.Clear()
 		leftPane.AddItem(searchInput, 1, 0, false)
-		leftPane.AddItem(sessionList, 0, 1, false)
+		leftPane.AddItem(tree, 0, 1, false)
 		app.SetFocus(searchInput)
 	}
 
 	hideSearch := func() {
 		searching = false
 		leftPane.Clear()
-		leftPane.AddItem(sessionList, 0, 1, true)
+		leftPane.AddItem(tree, 0, 1, true)
 		searchInput.SetText("")
 		currentFilter = ""
-		populateList("")
+		populateTree("")
 		focusIdx = 0
-		app.SetFocus(sessionList)
+		app.SetFocus(tree)
 		updateBorders()
 	}
 
@@ -1651,14 +1689,14 @@ func main() {
 			hideSearch()
 		} else if key == tcell.KeyEnter {
 			focusIdx = 0
-			app.SetFocus(sessionList)
+			app.SetFocus(tree)
 			updateBorders()
 		}
 	})
 
 	searchInput.SetChangedFunc(func(text string) {
 		currentFilter = text
-		populateList(text)
+		populateTree(text)
 	})
 
 	// ── Key bindings ──
@@ -1670,26 +1708,6 @@ func main() {
 		}
 
 		switch ev.Key() {
-		case tcell.KeyLeft: // Collapse group
-			idx := sessionList.GetCurrentItem()
-			if idx >= 0 && idx < len(itemGroup) && itemGroup[idx] != "" {
-				grp := itemGroup[idx]
-				if !collapsed[grp] {
-					collapsed[grp] = true
-					populateList(currentFilter)
-				}
-			}
-			return nil
-		case tcell.KeyRight: // Expand group
-			idx := sessionList.GetCurrentItem()
-			if idx >= 0 && idx < len(itemGroup) && itemGroup[idx] != "" {
-				grp := itemGroup[idx]
-				if collapsed[grp] {
-					collapsed[grp] = false
-					populateList(currentFilter)
-				}
-			}
-			return nil
 		case tcell.KeyTab:
 			if previewOpen {
 				focusIdx = (focusIdx + 1) % len(focusables)
@@ -1751,7 +1769,7 @@ func main() {
 						SetBackgroundColor(tcell.ColorDarkSlateGray)
 					helpText.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 						app.SetRoot(mainLayout, true)
-						app.SetFocus(sessionList)
+						app.SetFocus(tree)
 						return nil
 					})
 					helpPage := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -1768,8 +1786,6 @@ func main() {
 					app.SetFocus(helpText)
 					return nil
 
-
-
 				case 'i':
 					requestSummary()
 					return nil
@@ -1779,22 +1795,23 @@ func main() {
 					return nil
 
 				case 't': // Toggle pin
-					idx := sessionList.GetCurrentItem()
-					if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
-						s := sessions[filteredIdx[idx]]
-						if s.Pinned {
-							s.Pinned = false
-							delete(localPins, s.ID)
-							statusBar.SetText(fmt.Sprintf("[yellow]고정 해제: %s[-]", esc(s.ProjectName)))
-						} else {
-							s.Pinned = true
-							localPins[s.ID] = true
-							statusBar.SetText(fmt.Sprintf("[green]📌 고정: %s[-]", esc(s.ProjectName)))
-						}
-						savePins(localPins)
-						sessions = discoverSessions()
-						populateList(currentFilter)
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
+						return nil
 					}
+					if s.Pinned {
+						s.Pinned = false
+						delete(localPins, s.ID)
+						statusBar.SetText(fmt.Sprintf("[yellow]고정 해제: %s[-]", esc(s.ProjectName)))
+					} else {
+						s.Pinned = true
+						localPins[s.ID] = true
+						statusBar.SetText(fmt.Sprintf("[green]📌 고정: %s[-]", esc(s.ProjectName)))
+					}
+					savePins(localPins)
+					sessions = discoverSessions()
+					populateTree(currentFilter)
 					return nil
 
 				case 'r': // Refresh
@@ -1806,28 +1823,28 @@ func main() {
 						app.QueueUpdateDraw(func() {
 							sessions = fresh
 							aliases = loadAliases()
-							populateList(currentFilter)
+							populateTree(currentFilter)
 						})
 					}()
 					return nil
 
 				case ' ': // Toggle multi-select
-					idx := sessionList.GetCurrentItem()
-					if idx >= 0 && idx < len(filteredIdx) && filteredIdx[idx] >= 0 {
-						s := sessions[filteredIdx[idx]]
-						s.Selected = !s.Selected
-						populateList(currentFilter)
-						sessionList.SetCurrentItem(idx)
-						showSessionInfo(filteredIdx[idx])
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
+						return nil
 					}
+					s.Selected = !s.Selected
+					cur.SetText(sessionNodeText(s))
+					statusBar.SetText(defaultStatus())
 					return nil
 
 				case 'm': // Rename (alias)
-					idx := sessionList.GetCurrentItem()
-					if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
 						return nil
 					}
-					s := sessions[filteredIdx[idx]]
 					renameInput := tview.NewInputField().
 						SetLabel(" 새 이름: ").
 						SetText(s.Alias).
@@ -1847,7 +1864,7 @@ func main() {
 							}
 							saveAliases(aliases)
 							sessions = discoverSessions()
-							populateList(currentFilter)
+							populateTree(currentFilter)
 							if newAlias != "" {
 								statusBar.SetText(fmt.Sprintf("[green]이름 변경: %s[-]", esc(newAlias)))
 							} else {
@@ -1855,7 +1872,7 @@ func main() {
 							}
 						}
 						app.SetRoot(mainLayout, true)
-						app.SetFocus(sessionList)
+						app.SetFocus(tree)
 					})
 					modal := tview.NewFlex().SetDirection(tview.FlexRow).
 						AddItem(nil, 0, 1, false).
@@ -1872,11 +1889,11 @@ func main() {
 					return nil
 
 				case 'd': // Delete single session
-					idx := sessionList.GetCurrentItem()
-					if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
 						return nil
 					}
-					s := sessions[filteredIdx[idx]]
 					displayName := s.ProjectName
 					if s.Alias != "" {
 						displayName = s.Alias
@@ -1892,12 +1909,12 @@ func main() {
 									delete(aliases, s.ID)
 									saveAliases(aliases)
 									sessions = discoverSessions()
-									populateList(currentFilter)
+									populateTree(currentFilter)
 									statusBar.SetText(fmt.Sprintf("[green]삭제됨: %s[-]", esc(displayName)))
 								}
 							}
 							app.SetRoot(mainLayout, true)
-							app.SetFocus(sessionList)
+							app.SetFocus(tree)
 						})
 					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
 					confirmModal.SetButtonBackgroundColor(tcell.ColorDimGray)
@@ -1933,11 +1950,11 @@ func main() {
 								}
 								saveAliases(aliases)
 								sessions = discoverSessions()
-								populateList(currentFilter)
+								populateTree(currentFilter)
 								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
 							}
 							app.SetRoot(mainLayout, true)
-							app.SetFocus(sessionList)
+							app.SetFocus(tree)
 						})
 					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
 					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
@@ -1948,11 +1965,11 @@ func main() {
 					return nil
 
 				case 'o': // Open session folder in Finder
-					idx := sessionList.GetCurrentItem()
-					if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
 						return nil
 					}
-					s := sessions[filteredIdx[idx]]
 					dir := filepath.Dir(s.SessionFile)
 					if err := exec.Command("open", dir).Run(); err != nil {
 						statusBar.SetText(fmt.Sprintf("[red]폴더 열기 실패: %v[-]", err))
@@ -1975,7 +1992,7 @@ func main() {
 			app.QueueUpdateDraw(func() {
 				sessions = fresh
 				aliases = loadAliases()
-				populateList(currentFilter)
+				populateTree(currentFilter)
 			})
 		}
 	}()
