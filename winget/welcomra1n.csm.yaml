@@ -1,0 +1,14 @@
+PackageIdentifier: welcomra1n.csm
+PackageVersion: 0.1.0
+PackageName: csm
+Publisher: welcomra1n
+License: MIT
+ShortDescription: Claude Code + Codex session manager TUI
+PackageUrl: https://github.com/welcomra1n/session-manager-tui
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/welcomra1n/session-manager-tui/releases/download/v0.1.0/csm-windows-amd64.exe
+    InstallerSha256: 3ddb6382211cc2b2b1d5d8ba1689f8d34e077f818b74818745054cd93fc9f00d
+    InstallerType: portable
+ManifestType: singleton
+ManifestVersion: 1.6.0

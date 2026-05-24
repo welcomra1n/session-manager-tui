@@ -106,18 +106,28 @@ Provider (Claude/Codex)
 
 ## 설치
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap welcomra1n/tap
+brew install csm
+```
+
+### Windows (winget)
+
+```powershell
+# winget 등록 전 수동 설치
+Invoke-WebRequest -Uri "https://github.com/welcomra1n/session-manager-tui/releases/download/v0.1.0/csm-windows-amd64.exe" -OutFile "$env:LOCALAPPDATA\csm.exe"
+```
+
+### 소스 빌드
+
 Go 1.21+ 필요.
 
 ```bash
 git clone https://github.com/welcomra1n/session-manager-tui.git
 cd session-manager-tui
 go build -o csm .
-```
-
-PATH에 추가:
-
-```bash
-cp csm /usr/local/bin/
 ```
 
 ## 사용법
@@ -187,12 +197,12 @@ make build-all
 - `csm-linux-arm64`
 - `csm-windows-amd64.exe`
 
-## Homebrew 설치 (예정)
+## 패키지 매니저
 
-```bash
-brew tap welcomra1n/tap
-brew install csm
-```
+| 매니저 | 상태 | 명령어 |
+|--------|------|--------|
+| Homebrew | ✅ 사용 가능 | `brew tap welcomra1n/tap && brew install csm` |
+| winget | 📝 등록 예정 | 수동 설치 (위 참고) |
 
 ## 개선 예정
 
