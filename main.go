@@ -239,13 +239,67 @@ func padRight(s string, n int) string {
 	return s
 }
 
-// isSessionActive checks if a session file was modified very recently (likely in use)
+// isSessionActive checks if a session is currently in use.
+// 1) File modified within 2 minutes, OR
+// 2) A claude/codex process is running with this session ID
 func isSessionActive(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
-	return time.Since(info.ModTime()) < 2*time.Minute
+	if time.Since(info.ModTime()) < 2*time.Minute {
+		return true
+	}
+	return false
+}
+
+// cachedActiveIDs caches process-based active session IDs (refreshed periodically)
+var cachedActiveIDs map[string]bool
+var cachedActiveIDsTime time.Time
+
+func refreshActiveIDs() map[string]bool {
+	if time.Since(cachedActiveIDsTime) < 5*time.Second && cachedActiveIDs != nil {
+		return cachedActiveIDs
+	}
+	ids := make(map[string]bool)
+	// Check claude processes: claude --resume <ID>
+	if out, err := exec.Command("pgrep", "-afl", "claude.*--resume").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if idx := strings.Index(line, "--resume"); idx >= 0 {
+				rest := strings.TrimSpace(line[idx+len("--resume"):])
+				fields := strings.Fields(rest)
+				if len(fields) > 0 {
+					ids[fields[0]] = true
+				}
+			}
+		}
+	}
+	// Check codex processes: codex resume <ID>
+	if out, err := exec.Command("pgrep", "-afl", "codex.*resume").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if idx := strings.Index(line, "resume"); idx >= 0 {
+				rest := strings.TrimSpace(line[idx+len("resume"):])
+				fields := strings.Fields(rest)
+				if len(fields) > 0 {
+					// Skip flags starting with -
+					for _, f := range fields {
+						if !strings.HasPrefix(f, "-") {
+							ids[f] = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	cachedActiveIDs = ids
+	cachedActiveIDsTime = time.Now()
+	return ids
+}
+
+func isSessionActiveByProcess(sessionID string) bool {
+	ids := refreshActiveIDs()
+	return ids[sessionID]
 }
 
 func entrypointIcon(ep string) string {
@@ -1113,9 +1167,9 @@ func discoverSessions() []*Session {
 		}
 	}
 
-	// Detect active sessions
+	// Detect active sessions (file mod time OR running process)
 	for _, s := range out {
-		s.Active = isSessionActive(s.SessionFile)
+		s.Active = isSessionActive(s.SessionFile) || isSessionActiveByProcess(s.ID)
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].ModTime.After(out[j].ModTime) })
@@ -1133,11 +1187,12 @@ const (
 	backendKitty
 	backendWezTerm
 	backendGhostty
+	backendSSH
 	backendFallback
 )
 
 func (b termBackend) String() string {
-	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "fallback"}
+	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "SSH", "fallback"}
 	if int(b) < len(names) {
 		return names[b]
 	}
@@ -1162,6 +1217,10 @@ func detectBackend() termBackend {
 	}
 	if os.Getenv("KITTY_PID") != "" {
 		return backendKitty
+	}
+	// SSH detection — use tmux to open sessions in new window
+	if os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_CLIENT") != "" {
+		return backendSSH
 	}
 	return backendFallback
 }
@@ -1193,6 +1252,8 @@ func openInTerminal(command, dir string, inTab bool, app *tview.Application) err
 		return weztermOpen(command, dir, inTab)
 	case backendGhostty:
 		return ghosttyOpen(command, dir, inTab)
+	case backendSSH:
+		return sshOpen(command, dir, inTab, app)
 	default:
 		var runErr error
 		app.Suspend(func() {
@@ -1287,6 +1348,38 @@ func ghosttyOpen(command, dir string, inTab bool) error {
 		shell = "/bin/sh"
 	}
 	return exec.Command("open", "-na", "Ghostty", "--args", "-e", shell, "-c", fullCmd).Run()
+}
+
+func sshOpen(command, dir string, inTab bool, app *tview.Application) error {
+	fullCmd := fmt.Sprintf("cd '%s' && %s", escapeShell(dir), command)
+	// If tmux is available, use it to open a new window (csm stays running)
+	if _, err := exec.LookPath("tmux"); err == nil {
+		// Check if we're inside tmux (user started tmux manually)
+		if os.Getenv("TMUX") != "" {
+			return tmuxOpen(command, dir, inTab)
+		}
+		// Not in tmux — create a new detached tmux session and attach
+		sessionName := fmt.Sprintf("csm-%d", time.Now().UnixNano()%10000)
+		if err := exec.Command("tmux", "new-session", "-d", "-s", sessionName, "-c", dir, fullCmd).Run(); err != nil {
+			return err
+		}
+		// Suspend TUI, attach to tmux session, resume TUI when detached/exited
+		var runErr error
+		app.Suspend(func() {
+			cmd := exec.Command("tmux", "attach-session", "-t", sessionName)
+			cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+			runErr = cmd.Run()
+		})
+		return runErr
+	}
+	// No tmux — fallback to suspend
+	var runErr error
+	app.Suspend(func() {
+		cmd := exec.Command("sh", "-c", fullCmd)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		runErr = cmd.Run()
+	})
+	return runErr
 }
 
 // ── AI Summary ──────────────────────────────────────────────────────────────
