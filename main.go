@@ -621,16 +621,85 @@ func discoverCodexSessions() []*Session {
 
 // ── Session deletion ────────────────────────────────────────────────────────
 
+func trashDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "session-trash")
+}
+
 func deleteSession(s *Session) error {
-	// Delete the session file
-	if err := os.Remove(s.SessionFile); err != nil && !os.IsNotExist(err) {
-		return err
+	// Move to trash instead of deleting
+	trash := trashDir()
+	os.MkdirAll(trash, 0755)
+
+	destName := filepath.Base(s.SessionFile)
+	destPath := filepath.Join(trash, destName)
+	if err := os.Rename(s.SessionFile, destPath); err != nil {
+		// If rename fails (cross-device), copy then delete
+		data, readErr := os.ReadFile(s.SessionFile)
+		if readErr != nil {
+			return readErr
+		}
+		if writeErr := os.WriteFile(destPath, data, 0644); writeErr != nil {
+			return writeErr
+		}
+		os.Remove(s.SessionFile)
 	}
+
+	// Save metadata for restore
+	meta := map[string]string{
+		"originalPath": s.SessionFile,
+		"provider":     fmt.Sprintf("%d", s.Provider),
+		"id":           s.ID,
+		"deletedAt":    time.Now().Format(time.RFC3339),
+	}
+	metaData, _ := json.Marshal(meta)
+	os.WriteFile(destPath+".meta", metaData, 0644)
 
 	// For Codex sessions, also remove from session_index.jsonl
 	if s.Provider == ProviderCodex {
 		removeFromCodexIndex(s.ID)
 	}
+	return nil
+}
+
+func listTrash() []map[string]string {
+	trash := trashDir()
+	entries, err := os.ReadDir(trash)
+	if err != nil {
+		return nil
+	}
+	var items []map[string]string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".meta") {
+			data, err := os.ReadFile(filepath.Join(trash, e.Name()))
+			if err != nil {
+				continue
+			}
+			var meta map[string]string
+			if json.Unmarshal(data, &meta) == nil {
+				meta["trashFile"] = filepath.Join(trash, strings.TrimSuffix(e.Name(), ".meta"))
+				items = append(items, meta)
+			}
+		}
+	}
+	return items
+}
+
+func restoreFromTrash(item map[string]string) error {
+	trashFile := item["trashFile"]
+	origPath := item["originalPath"]
+	// Ensure parent dir exists
+	os.MkdirAll(filepath.Dir(origPath), 0755)
+	if err := os.Rename(trashFile, origPath); err != nil {
+		return err
+	}
+	os.Remove(trashFile + ".meta")
+	return nil
+}
+
+func permanentDeleteTrash(item map[string]string) error {
+	os.Remove(item["trashFile"])
+	os.Remove(item["trashFile"] + ".meta")
 	return nil
 }
 
@@ -1241,7 +1310,20 @@ func nodeRefStr(node *tview.TreeNode) string {
 
 // ── Session node text formatting ────────────────────────────────────────────
 
-func sessionNodeText(s *Session) string {
+func highlightText(text, query string) string {
+	if query == "" {
+		return text
+	}
+	lower := strings.ToLower(text)
+	lowerQ := strings.ToLower(query)
+	idx := strings.Index(lower, lowerQ)
+	if idx < 0 {
+		return text
+	}
+	return text[:idx] + "[yellow]" + text[idx:idx+len(query)] + "[-][white]" + text[idx+len(query):]
+}
+
+func sessionNodeText(s *Session, searchQuery ...string) string {
 	check := " "
 	if s.Selected {
 		check = "\xe2\x9c\x93" // ✓
@@ -1272,7 +1354,11 @@ func sessionNodeText(s *Session) string {
 
 	col1 := padRight(fmt.Sprintf("%s%s", check, activeIcon), 3)
 	col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
-	col3 := padRight(fmt.Sprintf("[white]%s[-]", esc(title)), 30)
+	displayTitle := title
+	if len(searchQuery) > 0 && searchQuery[0] != "" {
+		displayTitle = highlightText(title, searchQuery[0])
+	}
+	col3 := padRight(fmt.Sprintf("[white]%s[-]", esc(displayTitle)), 30)
 	col4 := padRight(fmt.Sprintf("[#999999]%s[-]", epIco), 4)
 	col5 := padRight(fmt.Sprintf("[#999999]%s[-]", expiryLabel(s)), 6)
 	return fmt.Sprintf("%s%s  %s  %s  %s", col1, col2, col3, col4, col5)
@@ -1332,7 +1418,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제\n[yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]x[-] 휴지통 | [yellow]o[-] 폴더 | [yellow]/[-] 검색 | [yellow]r[-] 새로고침 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1480,31 +1566,44 @@ func main() {
 
 	defaultStatus := func() string {
 		selected := 0
+		totalMsgs := 0
+		claudeCount := 0
+		codexCount := 0
+		expiring := 0
+		active := 0
 		for _, s := range sessions {
 			if s.Selected {
 				selected++
+			}
+			totalMsgs += s.MessageCount
+			if s.Provider == ProviderCodex {
+				codexCount++
+			} else {
+				claudeCount++
+			}
+			d := daysUntilExpiry(s)
+			if d >= 0 && d <= 3 {
+				expiring++
+			}
+			if s.Active {
+				active++
 			}
 		}
 		sel := ""
 		if selected > 0 {
 			sel = fmt.Sprintf(" | [red]%d개 선택됨[-]", selected)
 		}
-		// Count expiring soon sessions
-		expiring := 0
-		for _, s := range sessions {
-			d := daysUntilExpiry(s)
-			if d >= 0 && d <= 3 {
-				expiring++
-			}
-		}
 		expWarn := ""
 		if expiring > 0 {
 			expWarn = fmt.Sprintf(" | [red]⚠ %d개 만료 임박[-]", expiring)
 		}
+		activeInfo := ""
+		if active > 0 {
+			activeInfo = fmt.Sprintf(" | [lime]▶ %d 활성[-]", active)
+		}
 		return fmt.Sprintf(
-			"[green]%d개 세션[-] [gray](%s · %s)[-]%s%s",
-			len(sessions), activeBackend, sortLabels[sortMode], sel, expWarn,
-		)
+			"[green]%d개 세션[-] [gray](🧠%d 🤖%d · %d개 메시지 · %s · %s)[-]%s%s%s",
+			len(sessions), claudeCount, codexCount, totalMsgs, activeBackend, sortLabels[sortMode], sel, activeInfo, expWarn)
 	}
 
 	// Track the previously selected session ID to restore after rebuild
@@ -1579,7 +1678,7 @@ func main() {
 				pinGroupNode.SetSelectedTextStyle(selectedStyle)
 				provNode.AddChild(pinGroupNode)
 				for _, s := range pinned {
-					sNode := tview.NewTreeNode(sessionNodeText(s))
+					sNode := tview.NewTreeNode(sessionNodeText(s, filter))
 					sNode.SetReference(s)
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
@@ -1623,7 +1722,7 @@ func main() {
 					projNode.SetSelectedTextStyle(selectedStyle)
 					normGroupNode.AddChild(projNode)
 					for _, s := range projSessions {
-						sNode := tview.NewTreeNode(sessionNodeText(s))
+						sNode := tview.NewTreeNode(sessionNodeText(s, filter))
 						sNode.SetReference(s)
 						sNode.SetSelectable(true)
 						sNode.SetSelectedTextStyle(selectedStyle)
@@ -2095,7 +2194,7 @@ func main() {
 						return nil
 					}
 					s.Selected = !s.Selected
-					cur.SetText(sessionNodeText(s))
+					cur.SetText(sessionNodeText(s, currentFilter))
 					statusBar.SetText(defaultStatus())
 					return nil
 
@@ -2325,6 +2424,123 @@ func main() {
 						statusBar.SetText(fmt.Sprintf("[red]폴더 열기 실패: %v[-]", err))
 					} else {
 						statusBar.SetText(fmt.Sprintf("[green]폴더 열림: %s[-]", esc(dir)))
+					}
+					return nil
+
+				case 'x': // Trash view
+					trashItems := listTrash()
+					if len(trashItems) == 0 {
+						statusBar.SetText("[yellow]휴지통이 비어있습니다[-]")
+						return nil
+					}
+					trashList := tview.NewList().
+						ShowSecondaryText(false).
+						SetHighlightFullLine(true).
+						SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorDarkSlateGray).Foreground(tcell.ColorWhite))
+					for _, item := range trashItems {
+						label := fmt.Sprintf("  [#999999]%s[-]  [white]%s[-]", item["deletedAt"][:10], filepath.Base(item["trashFile"]))
+						trashList.AddItem(label, "", 0, nil)
+					}
+					trashList.SetSelectedFunc(func(idx int, _, _ string, _ rune) {
+						if idx >= len(trashItems) {
+							return
+						}
+						item := trashItems[idx]
+						actionModal := tview.NewModal().
+							SetText(fmt.Sprintf("세션: %s", filepath.Base(item["trashFile"]))).
+							AddButtons([]string{"복원", "영구 삭제", "취소"}).
+							SetDoneFunc(func(_ int, label string) {
+								switch label {
+								case "복원":
+									if err := restoreFromTrash(item); err != nil {
+										statusBar.SetText(fmt.Sprintf("[red]복원 실패: %v[-]", err))
+									} else {
+										sessions = discoverSessions()
+										sortSessions()
+										populateTree(currentFilter)
+										statusBar.SetText("[green]세션 복원됨[-]")
+									}
+								case "영구 삭제":
+									permanentDeleteTrash(item)
+									statusBar.SetText("[green]영구 삭제됨[-]")
+								}
+								app.SetRoot(mainLayout, true)
+								app.SetFocus(tree)
+							})
+						actionModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+						actionModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+						actionModal.SetButtonTextColor(tcell.ColorGray)
+						actionModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorDodgerBlue).Foreground(tcell.ColorWhite).Bold(true))
+						app.SetRoot(actionModal, true)
+					})
+					trashList.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						if ev.Key() == tcell.KeyEscape {
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+							return nil
+						}
+						return ev
+					})
+					trashList.SetBorder(true).
+						SetTitle(fmt.Sprintf(" 휴지통 (%d) ", len(trashItems))).
+						SetTitleAlign(tview.AlignCenter).
+						SetBorderColor(tcell.ColorRed)
+					trashFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(nil, 0, 1, false).
+						AddItem(tview.NewFlex().
+							AddItem(nil, 0, 1, false).
+							AddItem(trashList, 60, 0, true).
+							AddItem(nil, 0, 1, false), len(trashItems)+2, 0, true).
+						AddItem(nil, 0, 1, false)
+					pages := tview.NewPages().
+						AddPage("main", mainLayout, true, true).
+						AddPage("trash", trashFlex, true, true)
+					app.SetRoot(pages, true)
+					app.SetFocus(trashList)
+					return nil
+
+				case 'e': // Export session to markdown
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
+						return nil
+					}
+					home, _ := os.UserHomeDir()
+					title := s.Alias
+					if title == "" {
+						title = trunc(s.FirstUserMsg, 30)
+					}
+					if title == "" {
+						title = s.ID[:8]
+					}
+					// Sanitize filename
+					safeName := strings.Map(func(r rune) rune {
+						if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+							return '_'
+						}
+						return r
+					}, title)
+					exportPath := filepath.Join(home, "Desktop", safeName+".md")
+
+					var md strings.Builder
+					md.WriteString(fmt.Sprintf("# %s\n\n", title))
+					md.WriteString(fmt.Sprintf("- **세션 ID**: %s\n", s.ID))
+					md.WriteString(fmt.Sprintf("- **프로젝트**: %s\n", s.ProjectName))
+					md.WriteString(fmt.Sprintf("- **날짜**: %s\n", s.ModTime.Format("2006-01-02 15:04:05")))
+					md.WriteString(fmt.Sprintf("- **메시지**: %d개\n\n", s.MessageCount))
+					md.WriteString("---\n\n")
+					for _, msg := range s.Messages {
+						if msg.Type == "user" {
+							md.WriteString("## 👤 사용자\n\n")
+						} else {
+							md.WriteString("## 🤖 어시스턴트\n\n")
+						}
+						md.WriteString(msg.Content + "\n\n")
+					}
+					if err := os.WriteFile(exportPath, []byte(md.String()), 0644); err != nil {
+						statusBar.SetText(fmt.Sprintf("[red]내보내기 실패: %v[-]", err))
+					} else {
+						statusBar.SetText(fmt.Sprintf("[green]내보내기 완료: %s[-]", esc(exportPath)))
 					}
 					return nil
 				}
