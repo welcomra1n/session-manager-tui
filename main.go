@@ -443,14 +443,21 @@ func sessionActiveEnv(sessionID string) string {
 }
 
 func killSession(sessionID string) error {
-	ids := refreshActiveIDs()
-	info, ok := ids[sessionID]
-	if !ok || info.PID == "" {
+	// Find ALL PIDs related to this session ID
+	var pids []string
+	if out, err := exec.Command("pgrep", "-f", sessionID).CombinedOutput(); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			pid := strings.TrimSpace(line)
+			if pid != "" {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	if len(pids) == 0 {
 		return fmt.Errorf("활성 프로세스 없음")
 	}
-	if err := exec.Command("kill", info.PID).Run(); err != nil {
-		return fmt.Errorf("종료 실패: %v", err)
-	}
+	args := append([]string{"-TERM"}, pids...)
+	exec.Command("kill", args...).Run()
 	// Invalidate cache
 	cachedActiveIDsTime = time.Time{}
 	return nil
@@ -1992,6 +1999,12 @@ func main() {
 	// Track the previously selected session ID to restore after rebuild
 	var lastSelectedID string
 	sessionNum := 0
+	type activeNodeInfo struct {
+		Node    *tview.TreeNode
+		Session *Session
+		Num     int
+	}
+	var activeNodes []activeNodeInfo
 
 	populateTree := func(filter string) {
 		// Remember currently selected session
@@ -2024,6 +2037,7 @@ func main() {
 		var firstSessionNode *tview.TreeNode
 		var restoreNode *tview.TreeNode
 		sessionNum = 0
+		activeNodes = nil
 
 		addProviderGroup := func(provName string, provColor string, icon string, items []*Session, newRef string) {
 			if len(items) == 0 {
@@ -2074,6 +2088,9 @@ func main() {
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
 					pinGroupNode.AddChild(sNode)
+					if s.Active {
+						activeNodes = append(activeNodes, activeNodeInfo{Node: sNode, Session: s, Num: sessionNum})
+					}
 					if firstSessionNode == nil {
 						firstSessionNode = sNode
 					}
@@ -2134,6 +2151,9 @@ func main() {
 						sNode.SetSelectable(true)
 						sNode.SetSelectedTextStyle(selectedStyle)
 						projNode.AddChild(sNode)
+						if s.Active {
+							activeNodes = append(activeNodes, activeNodeInfo{Node: sNode, Session: s, Num: sessionNum})
+						}
 						if firstSessionNode == nil {
 							firstSessionNode = sNode
 						}
@@ -3166,24 +3186,25 @@ func main() {
 		}
 	}()
 
-	// Blink timer for active session indicator
+	// Blink timer for active session indicator (text-only update, no tree rebuild)
 	go func() {
 		ticker := time.NewTicker(800 * time.Millisecond)
 		defer ticker.Stop()
 		for range ticker.C {
-			hasActive := false
-			for _, s := range sessions {
-				if s.Active {
-					hasActive = true
-					break
+			if len(activeNodes) == 0 {
+				continue
+			}
+			blinkPhase = !blinkPhase
+			app.QueueUpdateDraw(func() {
+				for _, an := range activeNodes {
+					numPrefix := fmt.Sprintf("[#666666]%2d[-] ", an.Num)
+					nodeText := sessionNodeText(an.Session, currentFilter)
+					if compactMode {
+						nodeText = sessionNodeTextCompact(an.Session, currentFilter)
+					}
+					an.Node.SetText(numPrefix + nodeText)
 				}
-			}
-			if hasActive {
-				blinkPhase = !blinkPhase
-				app.QueueUpdateDraw(func() {
-					populateTree(currentFilter)
-				})
-			}
+			})
 		}
 	}()
 
