@@ -1611,7 +1611,7 @@ func activeIconFor(s *Session) string {
 	if blinkPhase {
 		return "[lime]●[-]" + envTag
 	}
-	return "[#006400]●[-]" + envTag
+	return " " + envTag
 }
 
 func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
