@@ -1609,7 +1609,7 @@ func activeIconFor(s *Session) string {
 		envTag = "[#999999]R[-]"
 	}
 	if blinkPhase {
-		return "[lime]●[-]" + envTag
+		return "[#39FF14]●[-]" + envTag
 	}
 	return " " + envTag
 }
