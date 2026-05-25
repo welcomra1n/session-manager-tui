@@ -3114,6 +3114,21 @@ func main() {
 					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
 					confirmModal.SetButtonTextColor(tcell.ColorGray)
 					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+					confirmModal.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						if ev.Key() == tcell.KeyRune && toEngKey(ev.Rune()) == 'k' {
+							if err := killSession(s.ID); err != nil {
+								statusBar.SetText(fmt.Sprintf("[red]%v[-]", err))
+							} else {
+								s.Active = false
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]세션 종료됨: %s[-]", esc(displayName)))
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+							return nil
+						}
+						return ev
+					})
 					app.SetRoot(confirmModal, true)
 					return nil
 
