@@ -364,14 +364,29 @@ func isSessionActive(path string) bool {
 }
 
 // cachedActiveIDs caches process-based active session IDs (refreshed periodically)
-var cachedActiveIDs map[string]bool
+// value: "local" (Ghostty/iTerm/Terminal), "ssh" (SSH session), "unknown"
+var cachedActiveIDs map[string]string
 var cachedActiveIDsTime time.Time
 
-func refreshActiveIDs() map[string]bool {
+func refreshActiveIDs() map[string]string {
 	if time.Since(cachedActiveIDsTime) < 5*time.Second && cachedActiveIDs != nil {
 		return cachedActiveIDs
 	}
-	ids := make(map[string]bool)
+	ids := make(map[string]string)
+
+	detectEnv := func(line, sessionID string) string {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "ssh") || strings.Contains(lower, "sshd") {
+			return "ssh"
+		}
+		if strings.Contains(lower, "ghostty") || strings.Contains(lower, "iterm") ||
+			strings.Contains(lower, "terminal") || strings.Contains(lower, "kitty") ||
+			strings.Contains(lower, "wezterm") {
+			return "local"
+		}
+		return "local"
+	}
+
 	// Check claude processes: claude --resume <ID>
 	if out, err := exec.Command("pgrep", "-afl", "claude.*--resume").CombinedOutput(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
@@ -379,7 +394,7 @@ func refreshActiveIDs() map[string]bool {
 				rest := strings.TrimSpace(line[idx+len("--resume"):])
 				fields := strings.Fields(rest)
 				if len(fields) > 0 {
-					ids[fields[0]] = true
+					ids[fields[0]] = detectEnv(line, fields[0])
 				}
 			}
 		}
@@ -391,10 +406,9 @@ func refreshActiveIDs() map[string]bool {
 				rest := strings.TrimSpace(line[idx+len("resume"):])
 				fields := strings.Fields(rest)
 				if len(fields) > 0 {
-					// Skip flags starting with -
 					for _, f := range fields {
 						if !strings.HasPrefix(f, "-") {
-							ids[f] = true
+							ids[f] = detectEnv(line, f)
 							break
 						}
 					}
@@ -409,7 +423,16 @@ func refreshActiveIDs() map[string]bool {
 
 func isSessionActiveByProcess(sessionID string) bool {
 	ids := refreshActiveIDs()
-	return ids[sessionID]
+	_, exists := ids[sessionID]
+	return exists
+}
+
+func sessionActiveEnv(sessionID string) string {
+	ids := refreshActiveIDs()
+	if env, ok := ids[sessionID]; ok {
+		return env
+	}
+	return ""
 }
 
 func entrypointIcon(ep string) string {
@@ -1573,11 +1596,21 @@ func highlightText(text, query string) string {
 	return text[:idx] + "[yellow]" + text[idx:idx+len(query)] + "[-][white]" + text[idx+len(query):]
 }
 
-func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
-	activeIcon := " "
-	if s.Active {
-		activeIcon = "[lime]▶[-]"
+func activeIconFor(s *Session) string {
+	if !s.Active {
+		return " "
 	}
+	env := sessionActiveEnv(s.ID)
+	switch env {
+	case "ssh":
+		return "[lime]▶[-][#999999]R[-]"
+	default:
+		return "[lime]▶[-] "
+	}
+}
+
+func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
+	activeIcon := activeIconFor(s)
 	title := s.Alias
 	if title == "" {
 		title = trunc(s.FirstUserMsg, 25)
@@ -1619,12 +1652,9 @@ func sessionNodeText(s *Session, searchQuery ...string) string {
 	} else if time.Since(s.ModTime) < 7*24*time.Hour {
 		dateColor = "[#00ff00]"
 	}
-	activeIcon := " "
-	if s.Active {
-		activeIcon = "[lime]\xe2\x96\xb6[-]"
-	}
+	activeIcon := activeIconFor(s)
 
-	col1 := padRight(fmt.Sprintf("%s%s", check, activeIcon), 3)
+	col1 := padRight(fmt.Sprintf("%s%s", check, activeIcon), 4)
 	col2 := padRight(fmt.Sprintf("%s%s[-]", dateColor, s.ModTime.Format("01/02 15:04")), 12)
 	displayTitle := title
 	if len(searchQuery) > 0 && searchQuery[0] != "" {
@@ -1728,7 +1758,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]s[-] 정렬 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]Space[-] 선택 | [yellow]D[-] 일괄삭제 | [yellow]E[-] 일괄내보내기 | [yellow]c[-] 컴팩트 | [yellow]x[-] 휴지통 | [yellow]/[-] 검색 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[yellow]1-9[-] 빠른열기 | [yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]Space[-] 선택 | [yellow]D[-] 일괄삭제 | [yellow]E[-] 일괄내보내기 | [yellow]c[-] 컴팩트 | [yellow]x[-] 휴지통 | [yellow]/[-] 검색 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1812,7 +1842,12 @@ func main() {
 			fmt.Fprintf(&b, "[yellow]제공자:[-]    %s %s\n", s.Provider.Icon(), s.Provider.Label())
 		}
 		if s.Active {
-			fmt.Fprintf(&b, "[yellow]상태:[-]        [lime]▶ 활성[-]\n")
+			env := sessionActiveEnv(s.ID)
+			envLabel := "로컬"
+			if env == "ssh" {
+				envLabel = "원격 (SSH)"
+			}
+			fmt.Fprintf(&b, "[yellow]상태:[-]        [lime]▶ 활성[-] (%s)\n", envLabel)
 		}
 		if s.Pinned {
 			fmt.Fprintf(&b, "[yellow]고정:[-]        \xf0\x9f\x93\x8c 고정됨\n")
@@ -1932,6 +1967,9 @@ func main() {
 
 	// Track the previously selected session ID to restore after rebuild
 	var lastSelectedID string
+	// Numbered session nodes for quick access (1-9)
+	var numberedNodes []*tview.TreeNode
+	sessionNum := 0
 
 	populateTree := func(filter string) {
 		// Remember currently selected session
@@ -1963,6 +2001,8 @@ func main() {
 
 		var firstSessionNode *tview.TreeNode
 		var restoreNode *tview.TreeNode
+		numberedNodes = nil
+		sessionNum = 0
 
 		addProviderGroup := func(provName string, provColor string, icon string, items []*Session, newRef string) {
 			if len(items) == 0 {
@@ -2002,15 +2042,23 @@ func main() {
 				pinGroupNode.SetSelectedTextStyle(selectedStyle)
 				provNode.AddChild(pinGroupNode)
 				for _, s := range pinned {
+					sessionNum++
+					numPrefix := ""
+					if sessionNum <= 9 {
+						numPrefix = fmt.Sprintf("[#666666]%d[-] ", sessionNum)
+					}
 					nodeText := sessionNodeText(s, filter)
 					if compactMode {
 						nodeText = sessionNodeTextCompact(s, filter)
 					}
-					sNode := tview.NewTreeNode(nodeText)
+					sNode := tview.NewTreeNode(numPrefix + nodeText)
 					sNode.SetReference(s)
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
 					pinGroupNode.AddChild(sNode)
+					if sessionNum <= 9 {
+						numberedNodes = append(numberedNodes, sNode)
+					}
 					if firstSessionNode == nil {
 						firstSessionNode = sNode
 					}
@@ -2060,15 +2108,23 @@ func main() {
 					projNode.SetSelectedTextStyle(selectedStyle)
 					normGroupNode.AddChild(projNode)
 					for _, s := range projSessions {
+						sessionNum++
+						numPrefix := ""
+						if sessionNum <= 9 {
+							numPrefix = fmt.Sprintf("[#666666]%d[-] ", sessionNum)
+						}
 						nodeText := sessionNodeText(s, filter)
-					if compactMode {
-						nodeText = sessionNodeTextCompact(s, filter)
-					}
-					sNode := tview.NewTreeNode(nodeText)
+						if compactMode {
+							nodeText = sessionNodeTextCompact(s, filter)
+						}
+						sNode := tview.NewTreeNode(numPrefix + nodeText)
 						sNode.SetReference(s)
 						sNode.SetSelectable(true)
 						sNode.SetSelectedTextStyle(selectedStyle)
 						projNode.AddChild(sNode)
+						if sessionNum <= 9 {
+							numberedNodes = append(numberedNodes, sNode)
+						}
 						if firstSessionNode == nil {
 							firstSessionNode = sNode
 						}
@@ -2420,6 +2476,14 @@ func main() {
 		case tcell.KeyRune:
 			if focusIdx == 0 {
 				switch toEngKey(ev.Rune()) {
+				case '1', '2', '3', '4', '5', '6', '7', '8', '9':
+					idx := int(toEngKey(ev.Rune()) - '1')
+					if idx >= 0 && idx < len(numberedNodes) {
+						tree.SetCurrentNode(numberedNodes[idx])
+						openSessionFromNode(numberedNodes[idx], true)
+					}
+					return nil
+
 				case '/':
 					showSearch()
 					return nil

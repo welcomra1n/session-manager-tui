@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then
+            EXT=".exe"
+          fi
+          OUTPUT="csm-${GOOS}-${GOARCH}${EXT}"
+          go build -ldflags="-s -w -X main.version=${VERSION}" -o "${OUTPUT}" .
+          echo "ARTIFACT=${OUTPUT}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: csm-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ARTIFACT }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts/ -type f
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --generate-notes \
+            $(find artifacts/ -type f -name 'csm-*')
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION_NUM="${VERSION#v}"
+
+          SHA_DARWIN_ARM64=$(sha256sum $(find artifacts/ -name 'csm-darwin-arm64') | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(sha256sum $(find artifacts/ -name 'csm-darwin-amd64') | awk '{print $1}')
+          SHA_LINUX_AMD64=$(sha256sum $(find artifacts/ -name 'csm-linux-amd64') | awk '{print $1}')
+          SHA_LINUX_ARM64=$(sha256sum $(find artifacts/ -name 'csm-linux-arm64') | awk '{print $1}')
+
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
+
+          FORMULA=$(cat <<'RUBY'
+          class Csm < Formula
+            desc "TUI session manager for Claude Code + Codex"
+            homepage "https://github.com/welcomra1n/session-manager-tui"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "URL_PLACEHOLDER/csm-darwin-arm64"
+                sha256 "SHA_DARWIN_ARM64_PLACEHOLDER"
+              else
+                url "URL_PLACEHOLDER/csm-darwin-amd64"
+                sha256 "SHA_DARWIN_AMD64_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "URL_PLACEHOLDER/csm-linux-arm64"
+                sha256 "SHA_LINUX_ARM64_PLACEHOLDER"
+              else
+                url "URL_PLACEHOLDER/csm-linux-amd64"
+                sha256 "SHA_LINUX_AMD64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install Dir.glob("csm-*").first => "csm"
+            end
+
+            test do
+              assert_match "csm", shell_output("#{bin}/csm --help 2>&1", 1)
+            end
+          end
+          RUBY
+          )
+
+          # Replace placeholders with actual values
+          FORMULA="${FORMULA//VERSION_PLACEHOLDER/${VERSION_NUM}}"
+          FORMULA="${FORMULA//URL_PLACEHOLDER/${BASE_URL}}"
+          FORMULA="${FORMULA//SHA_DARWIN_ARM64_PLACEHOLDER/${SHA_DARWIN_ARM64}}"
+          FORMULA="${FORMULA//SHA_DARWIN_AMD64_PLACEHOLDER/${SHA_DARWIN_AMD64}}"
+          FORMULA="${FORMULA//SHA_LINUX_AMD64_PLACEHOLDER/${SHA_LINUX_AMD64}}"
+          FORMULA="${FORMULA//SHA_LINUX_ARM64_PLACEHOLDER/${SHA_LINUX_ARM64}}"
+
+          # Remove leading whitespace (heredoc indentation)
+          FORMULA=$(echo "${FORMULA}" | sed 's/^          //')
+
+          # Base64 encode the formula content
+          CONTENT_BASE64=$(echo "${FORMULA}" | base64 -w 0)
+
+          # Get current file SHA (needed for update)
+          FILE_SHA=$(gh api "repos/welcomra1n/homebrew-tap/contents/Formula/csm.rb" \
+            --jq '.sha' 2>/dev/null || echo "")
+
+          if [ -n "${FILE_SHA}" ]; then
+            # Update existing file
+            gh api "repos/welcomra1n/homebrew-tap/contents/Formula/csm.rb" \
+              --method PUT \
+              --field message="Update csm to ${VERSION}" \
+              --field content="${CONTENT_BASE64}" \
+              --field sha="${FILE_SHA}"
+          else
+            # Create new file
+            gh api "repos/welcomra1n/homebrew-tap/contents/Formula/csm.rb" \
+              --method PUT \
+              --field message="Add csm formula at ${VERSION}" \
+              --field content="${CONTENT_BASE64}"
+          fi
