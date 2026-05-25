@@ -1596,17 +1596,22 @@ func highlightText(text, query string) string {
 	return text[:idx] + "[yellow]" + text[idx:idx+len(query)] + "[-][white]" + text[idx+len(query):]
 }
 
+// blinkPhase toggles every 500ms for active session indicator
+var blinkPhase bool
+
 func activeIconFor(s *Session) string {
 	if !s.Active {
-		return " "
+		return "  "
 	}
 	env := sessionActiveEnv(s.ID)
-	switch env {
-	case "ssh":
-		return "[lime]▶[-][#999999]R[-]"
-	default:
-		return "[lime]▶[-] "
+	envTag := ""
+	if env == "ssh" {
+		envTag = "[#999999]R[-]"
 	}
+	if blinkPhase {
+		return "[lime]●[-]" + envTag
+	}
+	return "[#006400]●[-]" + envTag
 }
 
 func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
@@ -1758,7 +1763,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]1-9[-] 빠른열기 | [yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]Space[-] 선택 | [yellow]D[-] 일괄삭제 | [yellow]E[-] 일괄내보내기 | [yellow]c[-] 컴팩트 | [yellow]x[-] 휴지통 | [yellow]/[-] 검색 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]Space[-] 선택 | [yellow]D[-] 일괄삭제 | [yellow]E[-] 일괄내보내기 | [yellow]c[-] 컴팩트 | [yellow]x[-] 휴지통 | [yellow]/[-] 검색 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1967,8 +1972,6 @@ func main() {
 
 	// Track the previously selected session ID to restore after rebuild
 	var lastSelectedID string
-	// Numbered session nodes for quick access (1-9)
-	var numberedNodes []*tview.TreeNode
 	sessionNum := 0
 
 	populateTree := func(filter string) {
@@ -2001,7 +2004,6 @@ func main() {
 
 		var firstSessionNode *tview.TreeNode
 		var restoreNode *tview.TreeNode
-		numberedNodes = nil
 		sessionNum = 0
 
 		addProviderGroup := func(provName string, provColor string, icon string, items []*Session, newRef string) {
@@ -2043,10 +2045,7 @@ func main() {
 				provNode.AddChild(pinGroupNode)
 				for _, s := range pinned {
 					sessionNum++
-					numPrefix := ""
-					if sessionNum <= 9 {
-						numPrefix = fmt.Sprintf("[#666666]%d[-] ", sessionNum)
-					}
+					numPrefix := fmt.Sprintf("[#666666]%2d[-] ", sessionNum)
 					nodeText := sessionNodeText(s, filter)
 					if compactMode {
 						nodeText = sessionNodeTextCompact(s, filter)
@@ -2056,9 +2055,6 @@ func main() {
 					sNode.SetSelectable(true)
 					sNode.SetSelectedTextStyle(selectedStyle)
 					pinGroupNode.AddChild(sNode)
-					if sessionNum <= 9 {
-						numberedNodes = append(numberedNodes, sNode)
-					}
 					if firstSessionNode == nil {
 						firstSessionNode = sNode
 					}
@@ -2109,10 +2105,7 @@ func main() {
 					normGroupNode.AddChild(projNode)
 					for _, s := range projSessions {
 						sessionNum++
-						numPrefix := ""
-						if sessionNum <= 9 {
-							numPrefix = fmt.Sprintf("[#666666]%d[-] ", sessionNum)
-						}
+						numPrefix := fmt.Sprintf("[#666666]%2d[-] ", sessionNum)
 						nodeText := sessionNodeText(s, filter)
 						if compactMode {
 							nodeText = sessionNodeTextCompact(s, filter)
@@ -2122,9 +2115,6 @@ func main() {
 						sNode.SetSelectable(true)
 						sNode.SetSelectedTextStyle(selectedStyle)
 						projNode.AddChild(sNode)
-						if sessionNum <= 9 {
-							numberedNodes = append(numberedNodes, sNode)
-						}
 						if firstSessionNode == nil {
 							firstSessionNode = sNode
 						}
@@ -2476,14 +2466,6 @@ func main() {
 		case tcell.KeyRune:
 			if focusIdx == 0 {
 				switch toEngKey(ev.Rune()) {
-				case '1', '2', '3', '4', '5', '6', '7', '8', '9':
-					idx := int(toEngKey(ev.Rune()) - '1')
-					if idx >= 0 && idx < len(numberedNodes) {
-						tree.SetCurrentNode(numberedNodes[idx])
-						openSessionFromNode(numberedNodes[idx], true)
-					}
-					return nil
-
 				case '/':
 					showSearch()
 					return nil
@@ -3112,6 +3094,27 @@ func main() {
 				updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
 				statusBar.SetText(defaultStatus())
 			})
+		}
+	}()
+
+	// Blink timer for active session indicator
+	go func() {
+		ticker := time.NewTicker(800 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			hasActive := false
+			for _, s := range sessions {
+				if s.Active {
+					hasActive = true
+					break
+				}
+			}
+			if hasActive {
+				blinkPhase = !blinkPhase
+				app.QueueUpdateDraw(func() {
+					populateTree(currentFilter)
+				})
+			}
 		}
 	}()
 
