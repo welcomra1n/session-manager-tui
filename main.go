@@ -363,28 +363,35 @@ func isSessionActive(path string) bool {
 	return false
 }
 
-// cachedActiveIDs caches process-based active session IDs (refreshed periodically)
-// value: "local" (Ghostty/iTerm/Terminal), "ssh" (SSH session), "unknown"
-var cachedActiveIDs map[string]string
+// activeInfo stores environment and PID for a running session
+type activeInfo struct {
+	Env string // "local" or "ssh"
+	PID string // process ID for killing
+}
+
+var cachedActiveIDs map[string]activeInfo
 var cachedActiveIDsTime time.Time
 
-func refreshActiveIDs() map[string]string {
+func refreshActiveIDs() map[string]activeInfo {
 	if time.Since(cachedActiveIDsTime) < 5*time.Second && cachedActiveIDs != nil {
 		return cachedActiveIDs
 	}
-	ids := make(map[string]string)
+	ids := make(map[string]activeInfo)
 
-	detectEnv := func(line, sessionID string) string {
+	detectEnv := func(line string) string {
 		lower := strings.ToLower(line)
 		if strings.Contains(lower, "ssh") || strings.Contains(lower, "sshd") {
 			return "ssh"
 		}
-		if strings.Contains(lower, "ghostty") || strings.Contains(lower, "iterm") ||
-			strings.Contains(lower, "terminal") || strings.Contains(lower, "kitty") ||
-			strings.Contains(lower, "wezterm") {
-			return "local"
-		}
 		return "local"
+	}
+
+	extractPID := func(line string) string {
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			return fields[0]
+		}
+		return ""
 	}
 
 	// Check claude processes: claude --resume <ID>
@@ -394,7 +401,7 @@ func refreshActiveIDs() map[string]string {
 				rest := strings.TrimSpace(line[idx+len("--resume"):])
 				fields := strings.Fields(rest)
 				if len(fields) > 0 {
-					ids[fields[0]] = detectEnv(line, fields[0])
+					ids[fields[0]] = activeInfo{Env: detectEnv(line), PID: extractPID(line)}
 				}
 			}
 		}
@@ -408,7 +415,7 @@ func refreshActiveIDs() map[string]string {
 				if len(fields) > 0 {
 					for _, f := range fields {
 						if !strings.HasPrefix(f, "-") {
-							ids[f] = detectEnv(line, f)
+							ids[f] = activeInfo{Env: detectEnv(line), PID: extractPID(line)}
 							break
 						}
 					}
@@ -429,10 +436,24 @@ func isSessionActiveByProcess(sessionID string) bool {
 
 func sessionActiveEnv(sessionID string) string {
 	ids := refreshActiveIDs()
-	if env, ok := ids[sessionID]; ok {
-		return env
+	if info, ok := ids[sessionID]; ok {
+		return info.Env
 	}
 	return ""
+}
+
+func killSession(sessionID string) error {
+	ids := refreshActiveIDs()
+	info, ok := ids[sessionID]
+	if !ok || info.PID == "" {
+		return fmt.Errorf("활성 프로세스 없음")
+	}
+	if err := exec.Command("kill", info.PID).Run(); err != nil {
+		return fmt.Errorf("종료 실패: %v", err)
+	}
+	// Invalidate cache
+	cachedActiveIDsTime = time.Time{}
+	return nil
 }
 
 func entrypointIcon(ep string) string {
@@ -1761,7 +1782,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[yellow]Enter[-] 열기 | [yellow]p[-] 미리보기 | [yellow]t[-] 고정 | [yellow]m[-] 이름변경 | [yellow]d[-] 삭제 | [yellow]e[-] 내보내기\n[yellow]Space[-] 선택 | [yellow]D[-] 일괄삭제 | [yellow]E[-] 일괄내보내기 | [yellow]c[-] 컴팩트 | [yellow]x[-] 휴지통 | [yellow]/[-] 검색 | [yellow]?[-] 도움말 | [yellow]Esc[-] 종료")
+	helpBar.SetText("[#666666]? 도움말 | Esc 종료[-]")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -1781,7 +1802,7 @@ func main() {
 
 	mainLayout := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(mainBody, 0, 1, true).
-		AddItem(helpBar, 2, 0, false).
+		AddItem(helpBar, 1, 0, false).
 		AddItem(statusBar, 1, 0, false)
 
 	previewOpen := false
@@ -2490,8 +2511,9 @@ func main() {
 							"[white]단축키:[-]\n" +
 							"  Enter=열기    p=미리보기   Space=선택   m=이름변경\n" +
 							"  d=삭제       D=일괄삭제   E=일괄내보내기  e=내보내기\n" +
-							"  c=컴팩트     o=폴더      /=검색       r=새로고침\n" +
-							"  t=고정       s=정렬      x=휴지통     Esc=종료\n\n" +
+							"  k=세션종료   c=컴팩트     o=폴더      /=검색\n" +
+							"  t=고정       s=정렬      x=휴지통     r=새로고침\n" +
+							"  u=업데이트   i=AI요약    Esc=종료\n\n" +
 							"[gray]아무 키나 누르면 닫힘[-]",
 					)
 					helpText.SetBorder(true).
@@ -3059,6 +3081,40 @@ func main() {
 					} else {
 						statusBar.SetText("[green]컴팩트 모드 OFF[-]")
 					}
+					return nil
+
+				case 'k': // Kill active session
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil || !s.Active {
+						statusBar.SetText("[yellow]활성 세션이 아닙니다[-]")
+						return nil
+					}
+					displayName := s.Alias
+					if displayName == "" {
+						displayName = trunc(s.FirstUserMsg, 30)
+					}
+					confirmModal := tview.NewModal().
+						SetText(fmt.Sprintf("세션을 종료하시겠습니까?\n\n%s", displayName)).
+						AddButtons([]string{"종료", "취소"}).
+						SetDoneFunc(func(_ int, label string) {
+							if label == "종료" {
+								if err := killSession(s.ID); err != nil {
+									statusBar.SetText(fmt.Sprintf("[red]%v[-]", err))
+								} else {
+									s.Active = false
+									populateTree(currentFilter)
+									statusBar.SetText(fmt.Sprintf("[green]세션 종료됨: %s[-]", esc(displayName)))
+								}
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+						})
+					confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+					confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+					confirmModal.SetButtonTextColor(tcell.ColorGray)
+					confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+					app.SetRoot(confirmModal, true)
 					return nil
 
 				case 'u': // Self-update
