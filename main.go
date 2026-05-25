@@ -1604,14 +1604,14 @@ func activeIconFor(s *Session) string {
 		return "  "
 	}
 	env := sessionActiveEnv(s.ID)
-	envTag := ""
+	color := "#39FF14" // 형광 초록 (로컬)
 	if env == "ssh" {
-		envTag = "[#999999]R[-]"
+		color = "#00F0FF" // 형광 파랑 (원격)
 	}
 	if blinkPhase {
-		return "[#39FF14]●[-]" + envTag
+		return fmt.Sprintf("[%s]●[-]", color)
 	}
-	return " " + envTag
+	return " "
 }
 
 func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
@@ -1652,8 +1652,6 @@ func sessionNodeText(s *Session, searchQuery ...string) string {
 	dateColor := "[#999999]"
 	if daysUntilExpiry(s) < 0 {
 		dateColor = "[#FF4444]"
-	} else if time.Since(s.ModTime) < 2*time.Minute {
-		dateColor = "[#00BFFF]"
 	} else if time.Since(s.ModTime) < 7*24*time.Hour {
 		dateColor = "[#00ff00]"
 	}
