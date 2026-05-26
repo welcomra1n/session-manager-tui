@@ -349,19 +349,6 @@ func padRight(s string, n int) string {
 	return s
 }
 
-// isSessionActive checks if a session is currently in use.
-// 1) File modified within 2 minutes, OR
-// 2) A claude/codex process is running with this session ID
-func isSessionActive(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	if time.Since(info.ModTime()) < 2*time.Minute {
-		return true
-	}
-	return false
-}
 
 // activeInfo stores environment and PID for a running session
 type activeInfo struct {
@@ -394,29 +381,65 @@ func refreshActiveIDs() map[string]activeInfo {
 		return ""
 	}
 
-	// Check claude processes: claude --resume <ID>
-	if out, err := exec.Command("pgrep", "-afl", "claude.*--resume").CombinedOutput(); err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if idx := strings.Index(line, "--resume"); idx >= 0 {
-				rest := strings.TrimSpace(line[idx+len("--resume"):])
-				fields := strings.Fields(rest)
-				if len(fields) > 0 {
-					ids[fields[0]] = activeInfo{Env: detectEnv(line), PID: extractPID(line)}
+	if runtime.GOOS == "windows" {
+		// Windows: use wmic to find processes
+		if out, err := exec.Command("cmd", "/c", "wmic process where \"commandline like '%--resume%'\" get processid,commandline /format:list").CombinedOutput(); err == nil {
+			lines := strings.Split(string(out), "\n")
+			var cmdLine, pid string
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "CommandLine=") {
+					cmdLine = line[len("CommandLine="):]
+				} else if strings.HasPrefix(line, "ProcessId=") {
+					pid = line[len("ProcessId="):]
+				}
+				if cmdLine != "" && pid != "" {
+					if idx := strings.Index(cmdLine, "--resume"); idx >= 0 {
+						rest := strings.TrimSpace(cmdLine[idx+len("--resume"):])
+						fields := strings.Fields(rest)
+						if len(fields) > 0 {
+							ids[fields[0]] = activeInfo{Env: "local", PID: pid}
+						}
+					} else if idx := strings.Index(cmdLine, "resume"); idx >= 0 {
+						rest := strings.TrimSpace(cmdLine[idx+len("resume"):])
+						fields := strings.Fields(rest)
+						for _, f := range fields {
+							if !strings.HasPrefix(f, "-") {
+								ids[f] = activeInfo{Env: "local", PID: pid}
+								break
+							}
+						}
+					}
+					cmdLine, pid = "", ""
 				}
 			}
 		}
-	}
-	// Check codex processes: codex resume <ID>
-	if out, err := exec.Command("pgrep", "-afl", "codex.*resume").CombinedOutput(); err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if idx := strings.Index(line, "resume"); idx >= 0 {
-				rest := strings.TrimSpace(line[idx+len("resume"):])
-				fields := strings.Fields(rest)
-				if len(fields) > 0 {
-					for _, f := range fields {
-						if !strings.HasPrefix(f, "-") {
-							ids[f] = activeInfo{Env: detectEnv(line), PID: extractPID(line)}
-							break
+	} else {
+		// Unix: use pgrep
+		// Check claude processes: claude --resume <ID>
+		if out, err := exec.Command("pgrep", "-afl", "claude.*--resume").CombinedOutput(); err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				if idx := strings.Index(line, "--resume"); idx >= 0 {
+					rest := strings.TrimSpace(line[idx+len("--resume"):])
+					fields := strings.Fields(rest)
+					if len(fields) > 0 {
+						ids[fields[0]] = activeInfo{Env: detectEnv(line), PID: extractPID(line)}
+					}
+				}
+			}
+		}
+		// Check codex processes: codex resume <ID>
+		if out, err := exec.Command("pgrep", "-afl", "codex.*resume").CombinedOutput(); err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				if idx := strings.Index(line, "resume"); idx >= 0 {
+					rest := strings.TrimSpace(line[idx+len("resume"):])
+					fields := strings.Fields(rest)
+					if len(fields) > 0 {
+						for _, f := range fields {
+							if !strings.HasPrefix(f, "-") {
+								ids[f] = activeInfo{Env: detectEnv(line), PID: extractPID(line)}
+								break
+							}
 						}
 					}
 				}
@@ -443,22 +466,40 @@ func sessionActiveEnv(sessionID string) string {
 }
 
 func killSession(sessionID string) error {
-	// Find ALL PIDs related to this session ID
 	var pids []string
-	if out, err := exec.Command("pgrep", "-f", sessionID).CombinedOutput(); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			pid := strings.TrimSpace(line)
-			if pid != "" {
-				pids = append(pids, pid)
+	if runtime.GOOS == "windows" {
+		if out, err := exec.Command("cmd", "/c", fmt.Sprintf("wmic process where \"commandline like '%%%s%%'\" get processid /format:list", sessionID)).CombinedOutput(); err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "ProcessId=") {
+					pid := line[len("ProcessId="):]
+					if pid != "" {
+						pids = append(pids, pid)
+					}
+				}
+			}
+		}
+	} else {
+		if out, err := exec.Command("pgrep", "-f", sessionID).CombinedOutput(); err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				pid := strings.TrimSpace(line)
+				if pid != "" {
+					pids = append(pids, pid)
+				}
 			}
 		}
 	}
 	if len(pids) == 0 {
 		return fmt.Errorf("활성 프로세스 없음")
 	}
-	args := append([]string{"-TERM"}, pids...)
-	exec.Command("kill", args...).Run()
-	// Invalidate cache
+	if runtime.GOOS == "windows" {
+		for _, pid := range pids {
+			exec.Command("taskkill", "/PID", pid, "/F").Run()
+		}
+	} else {
+		args := append([]string{"-TERM"}, pids...)
+		exec.Command("kill", args...).Run()
+	}
 	cachedActiveIDsTime = time.Time{}
 	return nil
 }
@@ -511,6 +552,16 @@ func decodePath(enc string) string {
 	if enc == "" {
 		return ""
 	}
+	// Windows: encoded path starts with drive letter like "C-Users-..."
+	if len(enc) >= 2 && enc[1] == '-' && ((enc[0] >= 'A' && enc[0] <= 'Z') || (enc[0] >= 'a' && enc[0] <= 'z')) {
+		root := string(enc[0]) + ":"
+		rest := enc[2:]
+		if result := resolveEncoded(root+string(filepath.Separator), rest); result != "" {
+			return result
+		}
+		return root + string(filepath.Separator) + strings.ReplaceAll(rest, "-", string(filepath.Separator))
+	}
+	// Unix: encoded path starts with "-" (representing "/")
 	if result := resolveEncoded("/", enc[1:]); result != "" {
 		return result
 	}
@@ -546,6 +597,7 @@ func resolveEncoded(base, remaining string) string {
 // ── Text helpers ────────────────────────────────────────────────────────────
 
 func lastSegment(p string) string {
+	p = filepath.ToSlash(p)
 	parts := strings.Split(p, "/")
 	return parts[len(parts)-1]
 }
@@ -1330,7 +1382,7 @@ func discoverSessions() []*Session {
 
 	// Detect active sessions (file mod time OR running process)
 	for _, s := range out {
-		s.Active = isSessionActive(s.SessionFile) || isSessionActiveByProcess(s.ID)
+		s.Active = isSessionActiveByProcess(s.ID)
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].ModTime.After(out[j].ModTime) })
@@ -1349,11 +1401,12 @@ const (
 	backendWezTerm
 	backendGhostty
 	backendSSH
+	backendWindows
 	backendFallback
 )
 
 func (b termBackend) String() string {
-	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "SSH", "fallback"}
+	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "SSH", "Windows", "fallback"}
 	if int(b) < len(names) {
 		return names[b]
 	}
@@ -1382,6 +1435,9 @@ func detectBackend() termBackend {
 	// SSH detection — use tmux to open sessions in new window
 	if os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_CLIENT") != "" {
 		return backendSSH
+	}
+	if runtime.GOOS == "windows" {
+		return backendWindows
 	}
 	return backendFallback
 }
@@ -1415,10 +1471,17 @@ func openInTerminal(command, dir string, inTab bool, app *tview.Application) err
 		return ghosttyOpen(command, dir, inTab)
 	case backendSSH:
 		return sshOpen(command, dir, inTab, app)
+	case backendWindows:
+		return windowsOpen(command, dir, app)
 	default:
 		var runErr error
 		app.Suspend(func() {
-			cmd := exec.Command("sh", "-c", fmt.Sprintf("cd '%s' && %s", escapeShell(dir), command))
+			var cmd *exec.Cmd
+			if runtime.GOOS == "windows" {
+				cmd = exec.Command("cmd", "/c", fmt.Sprintf("cd /d \"%s\" && %s", dir, command))
+			} else {
+				cmd = exec.Command("sh", "-c", fmt.Sprintf("cd '%s' && %s", escapeShell(dir), command))
+			}
 			cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 			runErr = cmd.Run()
 		})
@@ -1537,6 +1600,16 @@ func sshOpen(command, dir string, inTab bool, app *tview.Application) error {
 	var runErr error
 	app.Suspend(func() {
 		cmd := exec.Command("sh", "-c", fullCmd)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		runErr = cmd.Run()
+	})
+	return runErr
+}
+
+func windowsOpen(command, dir string, app *tview.Application) error {
+	var runErr error
+	app.Suspend(func() {
+		cmd := exec.Command("cmd", "/c", fmt.Sprintf("cd /d \"%s\" && %s", dir, command))
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		runErr = cmd.Run()
 	})

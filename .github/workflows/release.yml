@@ -88,7 +88,7 @@ jobs:
 
       - name: Update Homebrew formula
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_PAT }}
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
           VERSION_NUM="${VERSION#v}"
@@ -168,5 +168,71 @@ jobs:
             gh api "repos/welcomra1n/homebrew-tap/contents/Formula/csm.rb" \
               --method PUT \
               --field message="Add csm formula at ${VERSION}" \
+              --field content="${CONTENT_BASE64}"
+          fi
+
+  update-scoop:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update Scoop manifest
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_PAT }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION_NUM="${VERSION#v}"
+
+          SHA_WINDOWS_AMD64=$(sha256sum $(find artifacts/ -name 'csm-windows-amd64.exe') | awk '{print $1}')
+
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
+
+          MANIFEST=$(cat <<ENDJSON
+          {
+            "version": "${VERSION_NUM}",
+            "description": "TUI session manager for Claude Code + Codex",
+            "homepage": "https://github.com/welcomra1n/session-manager-tui",
+            "license": "MIT",
+            "architecture": {
+              "64bit": {
+                "url": "${BASE_URL}/csm-windows-amd64.exe",
+                "hash": "${SHA_WINDOWS_AMD64}"
+              }
+            },
+            "bin": [["csm-windows-amd64.exe", "csm"]],
+            "checkver": "github",
+            "autoupdate": {
+              "architecture": {
+                "64bit": {
+                  "url": "https://github.com/welcomra1n/session-manager-tui/releases/download/v\$version/csm-windows-amd64.exe"
+                }
+              }
+            }
+          }
+          ENDJSON
+          )
+
+          MANIFEST=$(echo "${MANIFEST}" | sed 's/^          //')
+
+          CONTENT_BASE64=$(echo "${MANIFEST}" | base64 -w 0)
+
+          FILE_SHA=$(gh api "repos/welcomra1n/scoop-bucket/contents/bucket/csm.json" \
+            --jq '.sha' 2>/dev/null || echo "")
+
+          if [ -n "${FILE_SHA}" ]; then
+            gh api "repos/welcomra1n/scoop-bucket/contents/bucket/csm.json" \
+              --method PUT \
+              --field message="Update csm to ${VERSION}" \
+              --field content="${CONTENT_BASE64}" \
+              --field sha="${FILE_SHA}"
+          else
+            gh api "repos/welcomra1n/scoop-bucket/contents/bucket/csm.json" \
+              --method PUT \
+              --field message="Add csm manifest at ${VERSION}" \
               --field content="${CONTENT_BASE64}"
           fi
