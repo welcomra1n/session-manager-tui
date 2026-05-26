@@ -1607,6 +1607,12 @@ func sshOpen(command, dir string, inTab bool, app *tview.Application) error {
 }
 
 func windowsOpen(command, dir string, app *tview.Application) error {
+	// Try Windows Terminal (wt.exe) first — opens new tab
+	if _, err := exec.LookPath("wt.exe"); err == nil {
+		fullCmd := fmt.Sprintf("cd /d \"%s\" && %s", dir, command)
+		return exec.Command("wt.exe", "-w", "0", "new-tab", "--startingDirectory", dir, "cmd", "/c", fullCmd).Run()
+	}
+	// Fallback: suspend TUI and run inline
 	var runErr error
 	app.Suspend(func() {
 		cmd := exec.Command("cmd", "/c", fmt.Sprintf("cd /d \"%s\" && %s", dir, command))
