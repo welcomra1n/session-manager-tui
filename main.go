@@ -21,7 +21,11 @@ import (
 
 // ── Version & update check ──────────────────────────────────────────────────
 
-const currentVersion = "0.1.0"
+var version = "dev"
+
+func currentVersion() string {
+	return strings.TrimPrefix(version, "v")
+}
 
 type githubRelease struct {
 	TagName string `json:"tag_name"`
@@ -47,7 +51,7 @@ func checkForUpdate() (newVersion, url string, hasUpdate bool) {
 		return "", "", false
 	}
 	tag := strings.TrimPrefix(release.TagName, "v")
-	if tag != "" && tag != currentVersion {
+	if tag != "" && tag != currentVersion() {
 		return tag, release.HTMLURL, true
 	}
 	return "", "", false
@@ -56,10 +60,10 @@ func checkForUpdate() (newVersion, url string, hasUpdate bool) {
 func selfUpdate() error {
 	newVer, _, has := checkForUpdate()
 	if !has {
-		fmt.Println("이미 최신 버전입니다:", currentVersion)
+		fmt.Println("이미 최신 버전입니다:", currentVersion())
 		return nil
 	}
-	fmt.Printf("업데이트 발견: %s → %s\n", currentVersion, newVer)
+	fmt.Printf("업데이트 발견: %s → %s\n", currentVersion(), newVer)
 
 	// Determine binary name for this platform
 	goos := runtime.GOOS
@@ -1785,7 +1789,7 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--version", "-v":
-			fmt.Printf("csm v%s (%s/%s)\n", currentVersion, runtime.GOOS, runtime.GOARCH)
+			fmt.Printf("csm v%s (%s/%s)\n", currentVersion(), runtime.GOOS, runtime.GOARCH)
 			return
 		case "--update", "-u":
 			if err := selfUpdate(); err != nil {
@@ -1801,7 +1805,7 @@ func main() {
 			return
 		case "--help", "-h":
 			fmt.Println("csm — Claude Code + Codex 세션 매니저")
-			fmt.Printf("버전: v%s\n\n", currentVersion)
+			fmt.Printf("버전: v%s\n\n", currentVersion())
 			fmt.Println("사용법:")
 			fmt.Println("  csm              TUI 실행")
 			fmt.Println("  csm --version    버전 표시")
@@ -1809,6 +1813,24 @@ func main() {
 			fmt.Println("  csm --config     설정 파일 보기")
 			fmt.Println("  csm --help       도움말")
 			return
+		}
+	}
+
+	// Auto-update check
+	if version != "dev" {
+		if newVer, _, has := checkForUpdate(); has {
+			fmt.Printf("⬆ 새 버전 발견: %s → %s\n", currentVersion(), newVer)
+			fmt.Print("업데이트 하시겠습니까? (y/N): ")
+			var answer string
+			fmt.Scanln(&answer)
+			if answer == "y" || answer == "Y" {
+				if err := selfUpdate(); err != nil {
+					fmt.Fprintf(os.Stderr, "업데이트 실패: %v\n", err)
+				} else {
+					fmt.Println("업데이트 완료. 다시 실행해주세요.")
+					return
+				}
+			}
 		}
 	}
 
@@ -3306,7 +3328,7 @@ func main() {
 							newVer, _, has := checkForUpdate()
 							app.QueueUpdateDraw(func() {
 								if !has {
-									statusBar.SetText("[green]이미 최신 버전입니다 (v" + currentVersion + ")[-]")
+									statusBar.SetText("[green]이미 최신 버전입니다 (v" + currentVersion() + ")[-]")
 								} else {
 									updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
 									statusBar.SetText(fmt.Sprintf("[yellow]새 버전 %s 발견. 터미널에서 csm --update 실행[-]", newVer))
