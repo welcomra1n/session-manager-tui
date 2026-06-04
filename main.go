@@ -27,6 +27,28 @@ func currentVersion() string {
 	return strings.TrimPrefix(version, "v")
 }
 
+func fuzzyMatch(haystack, needle string) bool {
+	if strings.Contains(haystack, needle) {
+		return true
+	}
+	hi := 0
+	for ni := 0; ni < len(needle); ni++ {
+		found := false
+		for hi < len(haystack) {
+			if haystack[hi] == needle[ni] {
+				hi++
+				found = true
+				break
+			}
+			hi++
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 type githubRelease struct {
 	TagName string `json:"tag_name"`
 	HTMLURL string `json:"html_url"`
@@ -218,6 +240,7 @@ type Session struct {
 	Entrypoint   string   // cli, claude-desktop, web, etc.
 	Active       bool     // session is currently open by another process
 	Pinned       bool     // pinned in Codex desktop
+	Loaded       bool
 }
 
 type Message struct {
@@ -1248,7 +1271,7 @@ func expiryLabel(s *Session) string {
 
 // ── Session loading ─────────────────────────────────────────────────────────
 
-func loadSession(path string) *Session {
+func loadSessionFast(path string) *Session {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil
@@ -1260,7 +1283,7 @@ func loadSession(path string) *Session {
 	if ppath == home {
 		pname = "미분류"
 	}
-	sess := &Session{
+	return &Session{
 		ID:          strings.TrimSuffix(filepath.Base(path), ".jsonl"),
 		ProjectDir:  ppath,
 		ProjectName: pname,
@@ -1268,10 +1291,12 @@ func loadSession(path string) *Session {
 		ModTime:     info.ModTime(),
 		FileSize:    info.Size(),
 	}
+}
 
-	f, err := os.Open(path)
+func loadSessionDetail(sess *Session) {
+	f, err := os.Open(sess.SessionFile)
 	if err != nil {
-		return nil
+		return
 	}
 	defer f.Close()
 
@@ -1283,7 +1308,6 @@ func loadSession(path string) *Session {
 		if json.Unmarshal(sc.Bytes(), &raw) != nil {
 			continue
 		}
-		// Read custom title from /rename command
 		if raw.Type == "custom-title" {
 			var ct struct {
 				CustomTitle string `json:"customTitle"`
@@ -1331,14 +1355,22 @@ func loadSession(path string) *Session {
 			sess.AsstMsgCount++
 		}
 	}
+	sess.Loaded = true
+}
 
+func loadSession(path string) *Session {
+	sess := loadSessionFast(path)
+	if sess == nil {
+		return nil
+	}
+	loadSessionDetail(sess)
 	if sess.MessageCount == 0 || (sess.UserMsgCount <= 1 && sess.AsstMsgCount <= 1) {
 		return nil
 	}
 	return sess
 }
 
-func discoverSessions() []*Session {
+func discoverSessionsFast() []*Session {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".claude", "projects")
 	entries, err := os.ReadDir(base)
@@ -1358,7 +1390,7 @@ func discoverSessions() []*Session {
 		}
 		for _, f := range files {
 			if strings.HasSuffix(f.Name(), ".jsonl") {
-				if s := loadSession(filepath.Join(dir, f.Name())); s != nil {
+				if s := loadSessionFast(filepath.Join(dir, f.Name())); s != nil {
 					if alias, ok := aliases[s.ID]; ok {
 						s.Alias = alias
 					}
@@ -1367,7 +1399,6 @@ func discoverSessions() []*Session {
 			}
 		}
 	}
-	// Merge Codex sessions
 	codexSessions := discoverCodexSessions()
 	for _, cs := range codexSessions {
 		if alias, ok := aliases[cs.ID]; ok {
@@ -1375,22 +1406,29 @@ func discoverSessions() []*Session {
 		}
 		out = append(out, cs)
 	}
-
-	// Apply pins (both local and Codex desktop)
 	pins := loadPins()
 	for _, s := range out {
 		if pins[s.ID] {
 			s.Pinned = true
 		}
 	}
-
-	// Detect active sessions (file mod time OR running process)
 	for _, s := range out {
 		s.Active = isSessionActiveByProcess(s.ID)
 	}
-
 	sort.Slice(out, func(i, j int) bool { return out[i].ModTime.After(out[j].ModTime) })
 	return out
+}
+
+func discoverSessions() []*Session {
+	out := discoverSessionsFast()
+	valid := out[:0]
+	for _, s := range out {
+		loadSessionDetail(s)
+		if s.MessageCount > 0 && (s.UserMsgCount > 1 || s.AsstMsgCount > 1) {
+			valid = append(valid, s)
+		}
+	}
+	return valid
 }
 
 // ── Terminal backend detection & integration ────────────────────────────────
@@ -1816,32 +1854,12 @@ func main() {
 		}
 	}
 
-	// Auto-update check
-	if version != "dev" {
-		if newVer, _, has := checkForUpdate(); has {
-			fmt.Printf("⬆ 새 버전 발견: %s → %s\n", currentVersion(), newVer)
-			fmt.Print("업데이트 하시겠습니까? (y/N): ")
-			var answer string
-			fmt.Scanln(&answer)
-			if answer == "y" || answer == "Y" {
-				if err := selfUpdate(); err != nil {
-					fmt.Fprintf(os.Stderr, "업데이트 실패: %v\n", err)
-				} else {
-					fmt.Println("업데이트 완료. 다시 실행해주세요.")
-					return
-				}
-			}
-		}
-	}
-
 	// Load config
 	cfg := loadConfig()
 	sessionExpiryDays = cfg.ExpiryDays
 
 	cleanOldTrash()
-	fmt.Print("세션 불러오는 중...")
-	sessions := discoverSessions()
-	fmt.Print("\r\033[2K")
+	sessions := discoverSessionsFast()
 
 	activeBackend = detectBackend()
 	app := tview.NewApplication()
@@ -2126,7 +2144,7 @@ func main() {
 		for _, s := range sessions {
 			if lowerFilter != "" {
 				haystack := strings.ToLower(s.ProjectName + " " + s.Alias + " " + s.FirstUserMsg + " " + s.LastUserMsg + " " + s.GitBranch)
-				if !strings.Contains(haystack, lowerFilter) {
+				if !fuzzyMatch(haystack, lowerFilter) {
 					continue
 				}
 			}
@@ -3331,12 +3349,23 @@ func main() {
 									statusBar.SetText("[green]이미 최신 버전입니다 (v" + currentVersion() + ")[-]")
 								} else {
 									updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
-									statusBar.SetText(fmt.Sprintf("[yellow]새 버전 %s 발견. 터미널에서 csm --update 실행[-]", newVer))
+									statusBar.SetText(fmt.Sprintf("[yellow]새 버전 %s 발견. u를 다시 누르면 업데이트[-]", newVer))
 								}
 							})
 						}()
 					} else {
-						statusBar.SetText("[yellow]터미널에서 csm --update 실행하세요[-]")
+						statusBar.SetText("[yellow]업데이트 중...[-]")
+						go func() {
+							err := selfUpdate()
+							app.QueueUpdateDraw(func() {
+								if err != nil {
+									statusBar.SetText(fmt.Sprintf("[red]업데이트 실패: %v[-]", err))
+								} else {
+									updateInfo = ""
+									statusBar.SetText("[green]업데이트 완료. csm을 다시 실행해주세요.[-]")
+								}
+							})
+						}()
 					}
 					return nil
 				}
@@ -3344,6 +3373,22 @@ func main() {
 		}
 		return ev
 	})
+
+	// Background detail loading
+	go func() {
+		valid := sessions[:0]
+		for _, s := range sessions {
+			loadSessionDetail(s)
+			if s.MessageCount > 0 && (s.UserMsgCount > 1 || s.AsstMsgCount > 1) {
+				valid = append(valid, s)
+			}
+		}
+		app.QueueUpdateDraw(func() {
+			sessions = valid
+			sortSessions()
+			populateTree(currentFilter)
+		})
+	}()
 
 	// Background update check
 	go func() {
