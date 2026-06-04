@@ -1571,7 +1571,9 @@ func ghosttyOpen(command, dir string, inTab bool) error {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	return exec.Command("open", "-a", "Ghostty", "--args", "-e", shell, "-c", fullCmd).Run()
+	cmd := exec.Command("ghostty", "-e", shell, "-c", fullCmd)
+	cmd.Dir = dir
+	return cmd.Start()
 }
 
 func sshOpen(command, dir string, inTab bool, app *tview.Application) error {
@@ -2302,7 +2304,27 @@ func main() {
 			cmd = "claude --dangerously-skip-permissions"
 			label = "Claude"
 		}
+		spinFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		stopSpin := make(chan struct{})
+		go func() {
+			i := 0
+			tick := time.NewTicker(80 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stopSpin:
+					return
+				case <-tick.C:
+					frame := spinFrames[i%len(spinFrames)]
+					app.QueueUpdateDraw(func() {
+						statusBar.SetText(fmt.Sprintf("[yellow]%s 여는 중...[-]", frame))
+					})
+					i++
+				}
+			}
+		}()
 		err := openInTerminal(cmd, dir, true, app)
+		close(stopSpin)
 		if err != nil {
 			statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
 		} else {
@@ -2436,7 +2458,27 @@ func main() {
 				dir, _ = os.UserHomeDir()
 			}
 		}
+		spinFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		stopSpin := make(chan struct{})
+		go func() {
+			i := 0
+			tick := time.NewTicker(80 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stopSpin:
+					return
+				case <-tick.C:
+					frame := spinFrames[i%len(spinFrames)]
+					app.QueueUpdateDraw(func() {
+						statusBar.SetText(fmt.Sprintf("[yellow]%s 여는 중...[-]", frame))
+					})
+					i++
+				}
+			}
+		}()
 		err := openInTerminal(resumeCmd, dir, inTab, app)
+		close(stopSpin)
 		if err != nil {
 			statusBar.SetText(fmt.Sprintf("[red]실패 (%s): %v[-]", activeBackend, err))
 		} else {
