@@ -1571,7 +1571,7 @@ func ghosttyOpen(command, dir string, inTab bool) error {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	return exec.Command("open", "-na", "Ghostty", "--args", "-e", shell, "-c", fullCmd).Run()
+	return exec.Command("open", "-a", "Ghostty", "--args", "-e", shell, "-c", fullCmd).Run()
 }
 
 func sshOpen(command, dir string, inTab bool, app *tview.Application) error {
