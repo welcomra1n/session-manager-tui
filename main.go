@@ -2833,18 +2833,26 @@ func main() {
 							AddButtons([]string{"삭제", "취소"}).
 							SetDoneFunc(func(_ int, label string) {
 								if label == "삭제" {
-									deleted := 0
+									deletedIDs := map[string]bool{}
 									for _, gs := range groupSessions {
 										if deleteSession(gs) == nil {
+											deletedIDs[gs.ID] = true
 											delete(aliases, gs.ID)
-											deleted++
 										}
 									}
+									if len(deletedIDs) > 0 {
+										filtered := sessions[:0]
+										for _, ss := range sessions {
+											if !deletedIDs[ss.ID] {
+												filtered = append(filtered, ss)
+											}
+										}
+										sessions = filtered
+									}
 									saveAliases(aliases)
-									sessions = discoverSessions()
 									sortSessions()
 									populateTree(currentFilter)
-									statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+									statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", len(deletedIDs)))
 								}
 								app.SetRoot(mainLayout, true)
 								app.SetFocus(tree)
@@ -2855,18 +2863,26 @@ func main() {
 						confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
 						confirmModal.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 							if ev.Key() == tcell.KeyRune && toEngKey(ev.Rune()) == 'd' {
-								deleted := 0
+								deletedIDs := map[string]bool{}
 								for _, gs := range groupSessions {
 									if deleteSession(gs) == nil {
+										deletedIDs[gs.ID] = true
 										delete(aliases, gs.ID)
-										deleted++
 									}
 								}
+								if len(deletedIDs) > 0 {
+									filtered := sessions[:0]
+									for _, ss := range sessions {
+										if !deletedIDs[ss.ID] {
+											filtered = append(filtered, ss)
+										}
+									}
+									sessions = filtered
+								}
 								saveAliases(aliases)
-								sessions = discoverSessions()
 								sortSessions()
 								populateTree(currentFilter)
-								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", len(deletedIDs)))
 								app.SetRoot(mainLayout, true)
 								app.SetFocus(tree)
 								return nil
@@ -2892,9 +2908,14 @@ func main() {
 								if err := deleteSession(s); err != nil {
 									statusBar.SetText(fmt.Sprintf("[red]삭제 실패: %v[-]", err))
 								} else {
+									for i, ss := range sessions {
+										if ss.ID == s.ID {
+											sessions = append(sessions[:i], sessions[i+1:]...)
+											break
+										}
+									}
 									delete(aliases, s.ID)
 									saveAliases(aliases)
-									sessions = discoverSessions()
 									sortSessions()
 									populateTree(currentFilter)
 									statusBar.SetText(fmt.Sprintf("[green]삭제됨: %s[-]", esc(displayName)))
@@ -2913,9 +2934,14 @@ func main() {
 							if err := deleteSession(s); err != nil {
 								statusBar.SetText(fmt.Sprintf("[red]삭제 실패: %v[-]", err))
 							} else {
+								for i, ss := range sessions {
+									if ss.ID == s.ID {
+										sessions = append(sessions[:i], sessions[i+1:]...)
+										break
+									}
+								}
 								delete(aliases, s.ID)
 								saveAliases(aliases)
-								sessions = discoverSessions()
 								sortSessions()
 								populateTree(currentFilter)
 								statusBar.SetText(fmt.Sprintf("[green]삭제됨: %s[-]", esc(displayName)))
@@ -3294,6 +3320,17 @@ func main() {
 		for range ticker.C {
 			fresh := discoverSessions()
 			app.QueueUpdateDraw(func() {
+				selectedIDs := map[string]bool{}
+				for _, s := range sessions {
+					if s.Selected {
+						selectedIDs[s.ID] = true
+					}
+				}
+				for _, s := range fresh {
+					if selectedIDs[s.ID] {
+						s.Selected = true
+					}
+				}
 				sessions = fresh
 				aliases = loadAliases()
 				populateTree(currentFilter)
