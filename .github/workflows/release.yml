@@ -65,16 +65,22 @@ jobs:
       - name: List artifacts
         run: find artifacts/ -type f
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
-          gh release create "${VERSION}" \
-            --title "${VERSION}" \
-            --generate-notes \
-            $(find artifacts/ -type f -name 'csm-*')
+          if gh release view "${VERSION}" &>/dev/null; then
+            echo "Release ${VERSION} exists, uploading assets..."
+            gh release upload "${VERSION}" --clobber \
+              $(find artifacts/ -type f -name 'csm-*')
+          else
+            gh release create "${VERSION}" \
+              --title "${VERSION}" \
+              --generate-notes \
+              $(find artifacts/ -type f -name 'csm-*')
+          fi
 
   update-homebrew:
     needs: release
