@@ -2843,56 +2843,68 @@ func main() {
 					return nil
 
 				case '?': // Help
-					helpText := tview.NewTextView().
-						SetDynamicColors(true).
-						SetTextAlign(tview.AlignLeft).
-						SetWordWrap(false)
-					helpText.SetText(
-						"[yellow]세션 매니저 도움말[-]\n\n" +
-							"[white]날짜 색상:[-]\n" +
-							"  [#00BFFF]파랑[-]   최근 2분 (활성)\n" +
-							"  [#00ff00]초록[-]   최근 7일\n" +
-							"  [#666666]회색[-]   7일 이상\n" +
-							"  [#FF4444]빨강[-]   만료 (30일+)\n\n" +
-							"[white]아이콘:[-]\n" +
-							"  Claude [#FF8C00]\xf0\x9f\xa7\xa0[-]  세션\n" +
-							"  Codex [#4A9EFF]\xf0\x9f\xa4\x96[-]  세션\n" +
-							"  \xe2\x96\xb6  활성 (사용 중)\n\n" +
-							"[white]열 구성:[-]  아이콘 | CLI/DSK/WEB | D-day | 날짜 | 프로젝트 | 제목\n\n" +
-							"[white]D-day:[-]  세션 만료까지 남은 일수 (기준 30일)\n" +
-							"  D-29 = 29일 남음  |  D+3 = 3일 전 만료\n\n" +
-							"[white]단축키:[-]\n" +
-							"  Enter=열기    p=미리보기   Space=선택   m=이름변경\n" +
-							"  d=삭제       D=일괄삭제   E=일괄내보내기  e=내보내기\n" +
-							"  k=세션종료   c=컴팩트     o=폴더      /=검색\n" +
-							"  t=고정       s=정렬      x=휴지통     r=새로고침\n" +
-							"  n=새폴더    v=폴더이동   g=태그      G=태그필터\n" +
-							"  V=일괄이동   C=폴더색상  </>=폴더순서\n" +
-							"  u=업데이트   i=AI요약    Esc=종료\n\n" +
-							"[gray]아무 키나 누르면 닫힘[-]",
-					)
-					helpText.SetBorder(true).
-						SetTitle(" 도움말 ").
-						SetTitleAlign(tview.AlignCenter).
-						SetBorderColor(tcell.ColorDodgerBlue).
-						SetBackgroundColor(tcell.ColorDarkSlateGray)
-					helpText.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+					col1 := tview.NewTextView().SetDynamicColors(true).SetWordWrap(false)
+					col1.SetText(
+						"[white]Enter[-] 세션 열기\n" +
+							"[white]Space[-] 다중 선택\n" +
+							"[white]p[-] 미리보기 토글\n" +
+							"[white]m[-] 이름 변경\n" +
+							"[white]d[-] 삭제\n" +
+							"[white]D[-] 일괄 삭제\n" +
+							"[white]k[-] 세션 종료\n" +
+							"[white]/[-] 검색\n" +
+							"[white]?[-] 도움말")
+					col1.SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+
+					col2 := tview.NewTextView().SetDynamicColors(true).SetWordWrap(false)
+					col2.SetText(
+						"[white]n[-] 새 폴더\n" +
+							"[white]v[-] 폴더로 이동\n" +
+							"[white]V[-] 일괄 폴더 이동\n" +
+							"[white]g[-] 태그 관리\n" +
+							"[white]G[-] 태그로 필터\n" +
+							"[white]C[-] 폴더 색상\n" +
+							"[white]</>[-] 폴더 순서\n" +
+							"[white]t[-] 고정\n" +
+							"[white]s[-] 정렬 변경")
+					col2.SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+
+					col3 := tview.NewTextView().SetDynamicColors(true).SetWordWrap(false)
+					col3.SetText(
+						"[white]e[-] 내보내기\n" +
+							"[white]E[-] 일괄 내보내기\n" +
+							"[white]c[-] 컴팩트 모드\n" +
+							"[white]o[-] 폴더 열기\n" +
+							"[white]x[-] 휴지통\n" +
+							"[white]r[-] 새로고침\n" +
+							"[white]u[-] 업데이트\n" +
+							"[white]i[-] AI 요약\n" +
+							"[white]Esc[-] 종료")
+					col3.SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+
+					helpRow := tview.NewFlex().SetDirection(tview.FlexColumn).
+						AddItem(col1, 0, 1, false).
+						AddItem(col2, 0, 1, false).
+						AddItem(col3, 0, 1, false)
+					helpRow.SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+
+					helpContainer := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(helpRow, 0, 1, false)
+					helpContainer.SetBorder(true).
+						SetBorderColor(tcell.ColorDimGray).
+						SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
+
+					helpWrapper := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(mainLayout, 0, 1, false).
+						AddItem(helpContainer, 11, 0, false)
+
+					helpWrapper.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 						app.SetRoot(mainLayout, true)
 						app.SetFocus(tree)
 						return nil
 					})
-					helpPage := tview.NewFlex().SetDirection(tview.FlexRow).
-						AddItem(nil, 0, 1, false).
-						AddItem(tview.NewFlex().
-							AddItem(nil, 0, 1, false).
-							AddItem(helpText, 65, 0, true).
-							AddItem(nil, 0, 1, false), 22, 0, true).
-						AddItem(nil, 0, 1, false)
-					pages := tview.NewPages().
-						AddPage("main", mainLayout, true, true).
-						AddPage("help", helpPage, true, true)
-					app.SetRoot(pages, true)
-					app.SetFocus(helpText)
+					app.SetRoot(helpWrapper, true)
+					app.SetFocus(helpWrapper)
 					return nil
 
 				case 'i':
