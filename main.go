@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1258,6 +1259,7 @@ type Metadata struct {
 	SessionTags    map[string][]string `json:"session_tags"`
 	FolderCollapsed map[string]bool    `json:"folder_collapsed"`
 	FolderColors   map[string]string   `json:"folder_colors"`
+	TempSessions   map[string]bool    `json:"temp_sessions"`
 }
 
 func metadataFilePath() string {
@@ -1272,6 +1274,7 @@ func loadMetadata() *Metadata {
 		SessionTags:     make(map[string][]string),
 		FolderCollapsed: make(map[string]bool),
 		FolderColors:    make(map[string]string),
+		TempSessions:    make(map[string]bool),
 	}
 	data, err := os.ReadFile(metadataFilePath())
 	if err != nil {
@@ -1292,12 +1295,23 @@ func loadMetadata() *Metadata {
 	if m.FolderColors == nil {
 		m.FolderColors = make(map[string]string)
 	}
+	if m.TempSessions == nil {
+		m.TempSessions = make(map[string]bool)
+	}
 	return m
 }
 
 func saveMetadata(m *Metadata) {
 	data, _ := json.MarshalIndent(m, "", "  ")
 	os.WriteFile(metadataFilePath(), data, 0644)
+}
+
+func generateUUID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // ── Expiry helpers ──────────────────────────────────────────────────────────
@@ -2282,6 +2296,9 @@ func main() {
 						}
 						nodeText += fmt.Sprintf(" [#CC66FF]%s[-]", tagStr[1:])
 					}
+					if meta.TempSessions[s.ID] {
+						nodeText += " [#FF6B6B]⏳임시[-]"
+					}
 					sNode := tview.NewTreeNode(numPrefix + nodeText)
 					sNode.SetReference(s)
 					sNode.SetSelectable(true)
@@ -2379,6 +2396,9 @@ func main() {
 							}
 							nodeText += fmt.Sprintf(" [#CC66FF]%s[-]", tagStr[1:])
 						}
+						if meta.TempSessions[s.ID] {
+							nodeText += " [#FF6B6B]⏳임시[-]"
+						}
 						sNode := tview.NewTreeNode(numPrefix + nodeText)
 						sNode.SetReference(s)
 						sNode.SetSelectable(true)
@@ -2432,6 +2452,9 @@ func main() {
 								tagStr += " #" + t
 							}
 							nodeText += fmt.Sprintf(" [#CC66FF]%s[-]", tagStr[1:])
+						}
+						if meta.TempSessions[s.ID] {
+							nodeText += " [#FF6B6B]⏳임시[-]"
 						}
 						sNode := tview.NewTreeNode(numPrefix + nodeText)
 						sNode.SetReference(s)
@@ -2878,6 +2901,8 @@ func main() {
 							"[white]x[-] 휴지통\n" +
 							"[white]r[-] 새로고침\n" +
 							"[white]u[-] 업데이트\n" +
+							"[white]T[-] 임시 세션\n" +
+							"[white]P[-] 임시→일반\n" +
 							"[white]i[-] AI 요약\n" +
 							"[white]Esc[-] 종료")
 					col3.SetBackgroundColor(tcell.NewRGBColor(30, 30, 30))
@@ -2896,7 +2921,7 @@ func main() {
 
 					helpWrapper := tview.NewFlex().SetDirection(tview.FlexRow).
 						AddItem(mainLayout, 0, 1, false).
-						AddItem(helpContainer, 11, 0, false)
+						AddItem(helpContainer, 13, 0, false)
 
 					helpWrapper.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 						app.SetRoot(mainLayout, true)
@@ -3367,6 +3392,67 @@ func main() {
 					} else {
 						statusBar.SetText(fmt.Sprintf("[green]폴더 열림: %s[-]", esc(dir)))
 					}
+					return nil
+
+				case 'T': // Temp session
+					home, _ := os.UserHomeDir()
+					sessionID := generateUUID()
+					cmd := fmt.Sprintf("claude --session-id %s --dangerously-skip-permissions", sessionID)
+					meta.TempSessions[sessionID] = true
+					saveMetadata(meta)
+					spinFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+					stopSpin := make(chan struct{})
+					go func() {
+						i := 0
+						tick := time.NewTicker(80 * time.Millisecond)
+						defer tick.Stop()
+						for {
+							select {
+							case <-stopSpin:
+								return
+							case <-tick.C:
+								frame := spinFrames[i%len(spinFrames)]
+								app.QueueUpdateDraw(func() {
+									statusBar.SetText(fmt.Sprintf("[yellow]%s 임시 세션 여는 중...[-]", frame))
+								})
+								i++
+							}
+						}
+					}()
+					err := openInTerminal(cmd, home, true, app)
+					close(stopSpin)
+					if err != nil {
+						delete(meta.TempSessions, sessionID)
+						saveMetadata(meta)
+						statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
+					} else {
+						statusBar.SetText("[green]임시 세션 열림 (종료 시 자동 삭제)[-]")
+						go func() {
+							time.Sleep(2 * time.Second)
+							fresh := discoverSessions()
+							app.QueueUpdateDraw(func() {
+								sessions = fresh
+								aliases = loadAliases()
+								sortSessions()
+								populateTree(currentFilter)
+							})
+						}()
+					}
+					return nil
+
+				case 'P': // Persist temp session (convert to normal)
+					s := nodeSession(tree.GetCurrentNode())
+					if s == nil {
+						return nil
+					}
+					if !meta.TempSessions[s.ID] {
+						statusBar.SetText("[yellow]임시 세션이 아닙니다[-]")
+						return nil
+					}
+					delete(meta.TempSessions, s.ID)
+					saveMetadata(meta)
+					populateTree(currentFilter)
+					statusBar.SetText("[green]일반 세션으로 변환됨[-]")
 					return nil
 
 				case 'n': // New folder
@@ -4180,6 +4266,32 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			fresh := discoverSessions()
+			// Auto-delete closed temp sessions
+			cleanedTemp := false
+			for id := range meta.TempSessions {
+				found := false
+				for _, s := range fresh {
+					if s.ID == id && s.Active {
+						found = true
+						break
+					}
+				}
+				if !found {
+					// Session closed or gone — find and delete
+					for _, s := range fresh {
+						if s.ID == id {
+							deleteSession(s)
+							break
+						}
+					}
+					delete(meta.TempSessions, id)
+					cleanedTemp = true
+				}
+			}
+			if cleanedTemp {
+				saveMetadata(meta)
+				fresh = discoverSessions()
+			}
 			app.QueueUpdateDraw(func() {
 				selectedIDs := map[string]bool{}
 				for _, s := range sessions {
