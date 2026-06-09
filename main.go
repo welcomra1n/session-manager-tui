@@ -1243,6 +1243,8 @@ type Metadata struct {
 	Folders        []string            `json:"folders"`
 	SessionFolders map[string]string   `json:"session_folders"`
 	SessionTags    map[string][]string `json:"session_tags"`
+	FolderCollapsed map[string]bool    `json:"folder_collapsed"`
+	FolderColors   map[string]string   `json:"folder_colors"`
 }
 
 func metadataFilePath() string {
@@ -1252,9 +1254,11 @@ func metadataFilePath() string {
 
 func loadMetadata() *Metadata {
 	m := &Metadata{
-		Folders:        []string{},
-		SessionFolders: make(map[string]string),
-		SessionTags:    make(map[string][]string),
+		Folders:         []string{},
+		SessionFolders:  make(map[string]string),
+		SessionTags:     make(map[string][]string),
+		FolderCollapsed: make(map[string]bool),
+		FolderColors:    make(map[string]string),
 	}
 	data, err := os.ReadFile(metadataFilePath())
 	if err != nil {
@@ -1268,6 +1272,12 @@ func loadMetadata() *Metadata {
 	}
 	if m.SessionTags == nil {
 		m.SessionTags = make(map[string][]string)
+	}
+	if m.FolderCollapsed == nil {
+		m.FolderCollapsed = make(map[string]bool)
+	}
+	if m.FolderColors == nil {
+		m.FolderColors = make(map[string]string)
 	}
 	return m
 }
@@ -2299,18 +2309,46 @@ func main() {
 					}
 				}
 
-				// Add custom folder nodes first, sorted alphabetically
-				folderOrder := make([]string, 0, len(folderMap))
+				// Add custom folder nodes first, using meta.Folders order
+				// Include all defined folders (even empty ones)
+				folderSeen := make(map[string]bool)
 				for f := range folderMap {
-					folderOrder = append(folderOrder, f)
+					folderSeen[f] = true
 				}
-				sort.Strings(folderOrder)
+				for _, f := range meta.Folders {
+					if !folderSeen[f] {
+						folderMap[f] = nil
+						folderSeen[f] = true
+					}
+				}
+				// Build ordered list: meta.Folders first, then any extras
+				folderOrder := make([]string, 0, len(folderMap))
+				metaSet := make(map[string]bool)
+				for _, f := range meta.Folders {
+					if folderSeen[f] {
+						folderOrder = append(folderOrder, f)
+						metaSet[f] = true
+					}
+				}
+				var extras []string
+				for f := range folderMap {
+					if !metaSet[f] {
+						extras = append(extras, f)
+					}
+				}
+				sort.Strings(extras)
+				folderOrder = append(folderOrder, extras...)
 				for _, folderName := range folderOrder {
 					folderSessions := folderMap[folderName]
-					folderNode := tview.NewTreeNode(fmt.Sprintf("[#CC66FF]%s[-] (%d)", esc(folderName), len(folderSessions)))
+					folderColor := "#CC66FF"
+					if c, ok := meta.FolderColors[folderName]; ok && c != "" {
+						folderColor = c
+					}
+					folderNode := tview.NewTreeNode(fmt.Sprintf("[%s]%s[-] (%d)", folderColor, esc(folderName), len(folderSessions)))
 					folderNode.SetReference("folder:" + folderName)
 					folderNode.SetSelectable(true)
-					folderNode.SetExpanded(true)
+					collapsed := meta.FolderCollapsed[folderName]
+					folderNode.SetExpanded(!collapsed)
 					folderNode.SetSelectedTextStyle(selectedStyle)
 					normGroupNode.AddChild(folderNode)
 					for _, s := range folderSessions {
@@ -2596,6 +2634,12 @@ func main() {
 		if s == nil {
 			// Toggle expand/collapse for group nodes
 			node.SetExpanded(!node.IsExpanded())
+			// Persist collapse state for folder nodes
+			if ref := nodeRefStr(node); strings.HasPrefix(ref, "folder:") {
+				folderName := strings.TrimPrefix(ref, "folder:")
+				meta.FolderCollapsed[folderName] = !node.IsExpanded()
+				saveMetadata(meta)
+			}
 			return
 		}
 		var resumeCmd string
@@ -2809,7 +2853,8 @@ func main() {
 							"  d=삭제       D=일괄삭제   E=일괄내보내기  e=내보내기\n" +
 							"  k=세션종료   c=컴팩트     o=폴더      /=검색\n" +
 							"  t=고정       s=정렬      x=휴지통     r=새로고침\n" +
-							"  n=새폴더    v=폴더이동   g=태그      \n" +
+							"  n=새폴더    v=폴더이동   g=태그      G=태그필터\n" +
+							"  V=일괄이동   C=폴더색상  </>=폴더순서\n" +
 							"  u=업데이트   i=AI요약    Esc=종료\n\n" +
 							"[gray]아무 키나 누르면 닫힘[-]",
 					)
@@ -3068,7 +3113,7 @@ func main() {
 					if strings.HasPrefix(refStr, "folder:") {
 						folderName := strings.TrimPrefix(refStr, "folder:")
 						// Remove folder and unassign all sessions
-						newFolders := meta.Folders[:0]
+						var newFolders []string
 						for _, f := range meta.Folders {
 							if f != folderName {
 								newFolders = append(newFolders, f)
@@ -3289,44 +3334,154 @@ func main() {
 					app.SetFocus(folderInput)
 					return nil
 
-				case 'v': // Move session to folder
-					s := nodeSession(tree.GetCurrentNode())
-					if s == nil {
-						return nil
+				case 'v': // Move session(s) to folder
+					// Check if any sessions are selected for batch move
+					var selectedSessions []*Session
+					for _, ss := range sessions {
+						if ss.Selected {
+							selectedSessions = append(selectedSessions, ss)
+						}
+					}
+					batchMode := len(selectedSessions) > 0
+					var singleSession *Session
+					if !batchMode {
+						singleSession = nodeSession(tree.GetCurrentNode())
+						if singleSession == nil {
+							return nil
+						}
 					}
 					if len(meta.Folders) == 0 {
 						statusBar.SetText("[red]폴더가 없습니다. n키로 먼저 생성하세요[-]")
 						return nil
 					}
-					// Build folder list with "(현재)" marker and "폴더 해제" option
-					currentFolder := meta.SessionFolders[s.ID]
 					list := tview.NewList()
+					moveTitle := " 폴더로 이동 "
+					if batchMode {
+						moveTitle = fmt.Sprintf(" %d개 세션 폴더로 이동 ", len(selectedSessions))
+					}
 					list.SetBorder(true).
-						SetTitle(" 폴더로 이동 ").
+						SetTitle(moveTitle).
 						SetTitleAlign(tview.AlignCenter).
 						SetBorderColor(tcell.ColorDodgerBlue).
 						SetBackgroundColor(tcell.ColorDarkSlateGray)
 					list.SetSelectedBackgroundColor(tcell.ColorDodgerBlue)
 					// "Remove from folder" option
 					list.AddItem("폴더 해제", "프로젝트 기본 그룹으로", 0, func() {
-						delete(meta.SessionFolders, s.ID)
+						if batchMode {
+							for _, ss := range selectedSessions {
+								delete(meta.SessionFolders, ss.ID)
+								ss.Selected = false
+							}
+							saveMetadata(meta)
+							populateTree(currentFilter)
+							statusBar.SetText(fmt.Sprintf("[green]%d개 세션 폴더 해제됨[-]", len(selectedSessions)))
+						} else {
+							delete(meta.SessionFolders, singleSession.ID)
+							saveMetadata(meta)
+							populateTree(currentFilter)
+							statusBar.SetText("[green]폴더 해제됨[-]")
+						}
+						app.SetRoot(mainLayout, true)
+						app.SetFocus(tree)
+					})
+					currentFolder := ""
+					if !batchMode {
+						currentFolder = meta.SessionFolders[singleSession.ID]
+					}
+					for _, folder := range meta.Folders {
+						f := folder // capture
+						label := f
+						if !batchMode && f == currentFolder {
+							label += " (현재)"
+						}
+						list.AddItem(label, "", 0, func() {
+							if batchMode {
+								for _, ss := range selectedSessions {
+									meta.SessionFolders[ss.ID] = f
+									ss.Selected = false
+								}
+								saveMetadata(meta)
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 → %s[-]", len(selectedSessions), esc(f)))
+							} else {
+								meta.SessionFolders[singleSession.ID] = f
+								saveMetadata(meta)
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]%s → %s[-]", esc(singleSession.ProjectName), esc(f)))
+							}
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+						})
+					}
+					list.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						if ev.Key() == tcell.KeyEscape {
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+							return nil
+						}
+						return ev
+					})
+					listHeight := len(meta.Folders) + 4
+					if listHeight > 15 {
+						listHeight = 15
+					}
+					modal := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(nil, 0, 1, false).
+						AddItem(tview.NewFlex().
+							AddItem(nil, 0, 1, false).
+							AddItem(list, 40, 0, true).
+							AddItem(nil, 0, 1, false), listHeight, 0, true).
+						AddItem(nil, 0, 1, false)
+					pages := tview.NewPages().
+						AddPage("main", mainLayout, true, true).
+						AddPage("move", modal, true, true)
+					app.SetRoot(pages, true)
+					app.SetFocus(list)
+					return nil
+
+				case 'V': // Batch folder move (selected only)
+					var selectedSessions []*Session
+					for _, ss := range sessions {
+						if ss.Selected {
+							selectedSessions = append(selectedSessions, ss)
+						}
+					}
+					if len(selectedSessions) == 0 {
+						statusBar.SetText("[yellow]선택된 세션이 없습니다. Space로 선택하세요[-]")
+						return nil
+					}
+					if len(meta.Folders) == 0 {
+						statusBar.SetText("[red]폴더가 없습니다. n키로 먼저 생성하세요[-]")
+						return nil
+					}
+					list := tview.NewList()
+					list.SetBorder(true).
+						SetTitle(fmt.Sprintf(" %d개 세션 폴더로 이동 ", len(selectedSessions))).
+						SetTitleAlign(tview.AlignCenter).
+						SetBorderColor(tcell.ColorDodgerBlue).
+						SetBackgroundColor(tcell.ColorDarkSlateGray)
+					list.SetSelectedBackgroundColor(tcell.ColorDodgerBlue)
+					list.AddItem("폴더 해제", "프로젝트 기본 그룹으로", 0, func() {
+						for _, ss := range selectedSessions {
+							delete(meta.SessionFolders, ss.ID)
+							ss.Selected = false
+						}
 						saveMetadata(meta)
 						populateTree(currentFilter)
-						statusBar.SetText("[green]폴더 해제됨[-]")
+						statusBar.SetText(fmt.Sprintf("[green]%d개 세션 폴더 해제됨[-]", len(selectedSessions)))
 						app.SetRoot(mainLayout, true)
 						app.SetFocus(tree)
 					})
 					for _, folder := range meta.Folders {
-						f := folder // capture
-						label := f
-						if f == currentFolder {
-							label += " (현재)"
-						}
-						list.AddItem(label, "", 0, func() {
-							meta.SessionFolders[s.ID] = f
+						f := folder
+						list.AddItem(f, "", 0, func() {
+							for _, ss := range selectedSessions {
+								meta.SessionFolders[ss.ID] = f
+								ss.Selected = false
+							}
 							saveMetadata(meta)
 							populateTree(currentFilter)
-							statusBar.SetText(fmt.Sprintf("[green]%s → %s[-]", esc(s.ProjectName), esc(f)))
+							statusBar.SetText(fmt.Sprintf("[green]%d개 세션 → %s[-]", len(selectedSessions), esc(f)))
 							app.SetRoot(mainLayout, true)
 							app.SetFocus(tree)
 						})
@@ -3366,13 +3521,33 @@ func main() {
 					if tags, ok := meta.SessionTags[s.ID]; ok {
 						currentTags = strings.Join(tags, ", ")
 					}
+					// Collect all unique existing tags for hint
+					allTagsMap := make(map[string]bool)
+					for _, tags := range meta.SessionTags {
+						for _, t := range tags {
+							allTagsMap[t] = true
+						}
+					}
+					var allTagsList []string
+					for t := range allTagsMap {
+						allTagsList = append(allTagsList, t)
+					}
+					sort.Strings(allTagsList)
+					tagTitle := " 태그 관리 "
+					if len(allTagsList) > 0 {
+						hint := strings.Join(allTagsList, ", ")
+						if len(hint) > 50 {
+							hint = hint[:47] + "..."
+						}
+						tagTitle = fmt.Sprintf(" 태그 관리 (기존: %s) ", hint)
+					}
 					tagInput := tview.NewInputField().
 						SetLabel(" 태그 (쉼표 구분): ").
 						SetText(currentTags).
 						SetFieldWidth(40).
 						SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
 					tagInput.SetBorder(true).
-						SetTitle(" 태그 관리 ").
+						SetTitle(tagTitle).
 						SetTitleAlign(tview.AlignCenter)
 					tagInput.SetDoneFunc(func(key tcell.Key) {
 						if key == tcell.KeyEnter {
@@ -3702,6 +3877,136 @@ func main() {
 						return ev
 					})
 					app.SetRoot(confirmModal, true)
+					return nil
+
+				case '<': // Move folder up in order
+					cur := tree.GetCurrentNode()
+					refStr := nodeRefStr(cur)
+					if strings.HasPrefix(refStr, "folder:") {
+						folderName := strings.TrimPrefix(refStr, "folder:")
+						for i, f := range meta.Folders {
+							if f == folderName && i > 0 {
+								meta.Folders[i], meta.Folders[i-1] = meta.Folders[i-1], meta.Folders[i]
+								saveMetadata(meta)
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]폴더 순서 변경: %s ↑[-]", esc(folderName)))
+								break
+							}
+						}
+					}
+					return nil
+
+				case '>': // Move folder down in order
+					cur := tree.GetCurrentNode()
+					refStr := nodeRefStr(cur)
+					if strings.HasPrefix(refStr, "folder:") {
+						folderName := strings.TrimPrefix(refStr, "folder:")
+						for i, f := range meta.Folders {
+							if f == folderName && i < len(meta.Folders)-1 {
+								meta.Folders[i], meta.Folders[i+1] = meta.Folders[i+1], meta.Folders[i]
+								saveMetadata(meta)
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]폴더 순서 변경: %s ↓[-]", esc(folderName)))
+								break
+							}
+						}
+					}
+					return nil
+
+				case 'C': // Cycle folder color
+					cur := tree.GetCurrentNode()
+					refStr := nodeRefStr(cur)
+					if strings.HasPrefix(refStr, "folder:") {
+						folderName := strings.TrimPrefix(refStr, "folder:")
+						presetColors := []string{"#CC66FF", "#FF6B6B", "#4ECDC4", "#FFE66D", "#95E1D3", "#FF8C00", "#6BCB77", "#4D96FF"}
+						currentColor := meta.FolderColors[folderName]
+						if currentColor == "" {
+							currentColor = "#CC66FF"
+						}
+						nextIdx := 0
+						for i, c := range presetColors {
+							if c == currentColor {
+								nextIdx = (i + 1) % len(presetColors)
+								break
+							}
+						}
+						meta.FolderColors[folderName] = presetColors[nextIdx]
+						saveMetadata(meta)
+						populateTree(currentFilter)
+						statusBar.SetText(fmt.Sprintf("[%s]%s[-] 색상 변경됨", presetColors[nextIdx], esc(folderName)))
+					}
+					return nil
+
+				case 'G': // Tag-based quick filter
+					cur := tree.GetCurrentNode()
+					s := nodeSession(cur)
+					if s == nil {
+						return nil
+					}
+					tags, ok := meta.SessionTags[s.ID]
+					if !ok || len(tags) == 0 {
+						statusBar.SetText("[yellow]태그가 없습니다[-]")
+						return nil
+					}
+					if len(tags) == 1 {
+						// Single tag: apply directly
+						filterText := "#" + tags[0]
+						searchInput.SetText(filterText)
+						currentFilter = filterText
+						searching = true
+						leftPane.Clear()
+						leftPane.AddItem(searchInput, 1, 0, false)
+						leftPane.AddItem(tree, 0, 1, false)
+						populateTree(filterText)
+						app.SetFocus(tree)
+						return nil
+					}
+					tagList := tview.NewList()
+					tagList.SetBorder(true).
+						SetTitle(" 태그 필터 선택 ").
+						SetTitleAlign(tview.AlignCenter).
+						SetBorderColor(tcell.ColorDodgerBlue).
+						SetBackgroundColor(tcell.ColorDarkSlateGray)
+					tagList.SetSelectedBackgroundColor(tcell.ColorDodgerBlue)
+					for _, tag := range tags {
+						t := tag // capture
+						tagList.AddItem("#"+t, "", 0, func() {
+							filterText := "#" + t
+							searchInput.SetText(filterText)
+							currentFilter = filterText
+							searching = true
+							leftPane.Clear()
+							leftPane.AddItem(searchInput, 1, 0, false)
+							leftPane.AddItem(tree, 0, 1, false)
+							populateTree(filterText)
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+						})
+					}
+					tagList.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+						if ev.Key() == tcell.KeyEscape {
+							app.SetRoot(mainLayout, true)
+							app.SetFocus(tree)
+							return nil
+						}
+						return ev
+					})
+					tagListHeight := len(tags) + 2
+					if tagListHeight > 15 {
+						tagListHeight = 15
+					}
+					tagModal := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(nil, 0, 1, false).
+						AddItem(tview.NewFlex().
+							AddItem(nil, 0, 1, false).
+							AddItem(tagList, 40, 0, true).
+							AddItem(nil, 0, 1, false), tagListHeight, 0, true).
+						AddItem(nil, 0, 1, false)
+					pages := tview.NewPages().
+						AddPage("main", mainLayout, true, true).
+						AddPage("tagfilter", tagModal, true, true)
+					app.SetRoot(pages, true)
+					app.SetFocus(tagList)
 					return nil
 
 				case 'u': // Self-update
