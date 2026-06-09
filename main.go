@@ -3156,6 +3156,63 @@ func main() {
 						return nil
 					}
 
+					// Check if any sessions are selected — batch delete
+					var selectedSessions []*Session
+					for _, ss := range sessions {
+						if ss.Selected {
+							selectedSessions = append(selectedSessions, ss)
+						}
+					}
+					if len(selectedSessions) > 0 {
+						confirmModal := tview.NewModal().
+							SetText(fmt.Sprintf("%d개 선택된 세션을 삭제하시겠습니까?", len(selectedSessions))).
+							AddButtons([]string{"삭제", "취소"}).
+							SetDoneFunc(func(_ int, label string) {
+								if label == "삭제" {
+									deleted := 0
+									for _, s := range selectedSessions {
+										if deleteSession(s) == nil {
+											delete(aliases, s.ID)
+											deleted++
+										}
+									}
+									saveAliases(aliases)
+									sessions = discoverSessions()
+									sortSessions()
+									populateTree(currentFilter)
+									statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+								}
+								app.SetRoot(mainLayout, true)
+								app.SetFocus(tree)
+							})
+						confirmModal.SetBackgroundColor(tcell.ColorDarkSlateGray)
+						confirmModal.SetButtonBackgroundColor(tcell.NewRGBColor(40, 40, 40))
+						confirmModal.SetButtonTextColor(tcell.ColorGray)
+						confirmModal.SetButtonActivatedStyle(tcell.StyleDefault.Background(tcell.ColorRed).Foreground(tcell.ColorWhite).Bold(true))
+						confirmModal.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+							if ev.Key() == tcell.KeyRune && toEngKey(ev.Rune()) == 'd' {
+								deleted := 0
+								for _, s := range selectedSessions {
+									if deleteSession(s) == nil {
+										delete(aliases, s.ID)
+										deleted++
+									}
+								}
+								saveAliases(aliases)
+								sessions = discoverSessions()
+								sortSessions()
+								populateTree(currentFilter)
+								statusBar.SetText(fmt.Sprintf("[green]%d개 세션 삭제됨[-]", deleted))
+								app.SetRoot(mainLayout, true)
+								app.SetFocus(tree)
+								return nil
+							}
+							return ev
+						})
+						app.SetRoot(confirmModal, true)
+						return nil
+					}
+
 					s := nodeSession(cur)
 
 					// Check if it's a group node with children sessions
