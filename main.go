@@ -79,6 +79,19 @@ func checkForUpdate() (newVersion, url string, hasUpdate bool) {
 	return "", "", false
 }
 
+func updateNotice(newVer string) string {
+	var cmd string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = "brew upgrade csm"
+	case "windows":
+		cmd = "scoop update csm"
+	default:
+		cmd = "csm --update"
+	}
+	return fmt.Sprintf("[yellow]⬆ v%s 사용 가능 · %s 또는 u키[-]", newVer, cmd)
+}
+
 func selfUpdate() error {
 	newVer, _, has := checkForUpdate()
 	if !has {
@@ -4018,7 +4031,7 @@ func main() {
 								if !has {
 									statusBar.SetText("[green]이미 최신 버전입니다 (v" + currentVersion() + ")[-]")
 								} else {
-									updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
+									updateInfo = updateNotice(newVer)
 									statusBar.SetText(fmt.Sprintf("[yellow]새 버전 %s 발견. u를 다시 누르면 업데이트[-]", newVer))
 								}
 							})
@@ -4064,7 +4077,7 @@ func main() {
 	go func() {
 		if newVer, _, has := checkForUpdate(); has {
 			app.QueueUpdateDraw(func() {
-				updateInfo = fmt.Sprintf("[yellow]⬆ 새 버전 %s 사용 가능[-]", newVer)
+				updateInfo = updateNotice(newVer)
 				statusBar.SetText(defaultStatus())
 			})
 		}
