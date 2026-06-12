@@ -254,6 +254,8 @@ type Session struct {
 	Entrypoint   string   // cli, claude-desktop, web, etc.
 	Active       bool     // session is currently open by another process
 	Pinned       bool     // pinned in Codex desktop
+	InputTokens  int64
+	OutputTokens int64
 	Loaded       bool
 }
 
@@ -580,6 +582,12 @@ func entrypointLabel(ep string) string {
 type msgEnvelope struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	Usage   *msgUsage       `json:"usage,omitempty"`
+}
+
+type msgUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
 }
 
 type contentBlock struct {
@@ -1401,6 +1409,10 @@ func loadSessionDetail(sess *Session) {
 		if json.Unmarshal(raw.Message, &env) != nil {
 			continue
 		}
+		if env.Usage != nil {
+			sess.InputTokens += env.Usage.InputTokens
+			sess.OutputTokens += env.Usage.OutputTokens
+		}
 		text := extractText(env.Content)
 		if text == "" {
 			continue
@@ -1842,6 +1854,19 @@ func activeIconFor(s *Session) string {
 	return " "
 }
 
+func formatTokens(n int64) string {
+	if n <= 0 {
+		return "0"
+	}
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
 func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
 	activeIcon := activeIconFor(s)
 	title := s.Alias
@@ -1858,7 +1883,11 @@ func sessionNodeTextCompact(s *Session, searchQuery ...string) string {
 	col1 := padRight(activeIcon, 2)
 	col2 := padRight(fmt.Sprintf("[white]%s[-]", esc(displayTitle)), 22)
 	col3 := padRight(fmt.Sprintf("[#999999]%s[-]", expiryLabel(s)), 5)
-	return fmt.Sprintf("%s%s %s", col1, col2, col3)
+	tokenStr := ""
+	if total := s.InputTokens + s.OutputTokens; total > 0 {
+		tokenStr = fmt.Sprintf(" [#888888]%s[-]", formatTokens(total))
+	}
+	return fmt.Sprintf("%s%s %s%s", col1, col2, col3, tokenStr)
 }
 
 func sessionNodeText(s *Session, searchQuery ...string) string {
@@ -1894,7 +1923,11 @@ func sessionNodeText(s *Session, searchQuery ...string) string {
 	col3 := padRight(fmt.Sprintf("[white]%s[-]", esc(displayTitle)), 30)
 	col4 := padRight(fmt.Sprintf("[#999999]%s[-]", epIco), 4)
 	col5 := padRight(fmt.Sprintf("[#999999]%s[-]", expiryLabel(s)), 6)
-	return fmt.Sprintf("%s%s  %s  %s  %s", col1, col2, col3, col4, col5)
+	tokenStr := ""
+	if total := s.InputTokens + s.OutputTokens; total > 0 {
+		tokenStr = fmt.Sprintf("  [#888888]%s tok[-]", formatTokens(total))
+	}
+	return fmt.Sprintf("%s%s  %s  %s  %s%s", col1, col2, col3, col4, col5, tokenStr)
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -2092,6 +2125,9 @@ func main() {
 		fmt.Fprintf(&b, "[yellow]만료:[-]      %s %s\n", expiryIcon(s), expiryLabel(s))
 		fmt.Fprintf(&b, "[yellow]크기:[-]        %s\n", fmtSize(s.FileSize))
 		fmt.Fprintf(&b, "[yellow]메시지:[-]    %d (%d 사용자, %d 어시스턴트)\n", s.MessageCount, s.UserMsgCount, s.AsstMsgCount)
+		if total := s.InputTokens + s.OutputTokens; total > 0 {
+			fmt.Fprintf(&b, "[yellow]토큰:[-]      %s (입력 %s, 출력 %s)\n", formatTokens(total), formatTokens(s.InputTokens), formatTokens(s.OutputTokens))
+		}
 		if s.GitBranch != "" {
 			fmt.Fprintf(&b, "[yellow]브랜치:[-]  %s\n", esc(s.GitBranch))
 		}
