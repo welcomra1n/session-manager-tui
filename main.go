@@ -1559,6 +1559,8 @@ func detectBackend() termBackend {
 		return backendWezTerm
 	case "ghostty":
 		return backendGhostty
+	case "Tabby":
+		return backendFallback
 	}
 	if os.Getenv("KITTY_PID") != "" {
 		return backendKitty
