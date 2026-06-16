@@ -1611,7 +1611,8 @@ func openInTerminal(command, dir string, inTab bool, app *tview.Application) err
 		app.Suspend(func() {
 			var cmd *exec.Cmd
 			if runtime.GOOS == "windows" {
-				cmd = exec.Command("cmd", "/c", fmt.Sprintf("cd /d \"%s\" && %s", dir, command))
+				cmd = exec.Command("powershell", "-NoProfile", "-Command",
+					fmt.Sprintf("Set-Location '%s'; %s", strings.ReplaceAll(dir, "'", "''"), command))
 			} else {
 				cmd = exec.Command("sh", "-c", fmt.Sprintf("cd '%s' && %s", escapeShell(dir), command))
 			}
@@ -1750,7 +1751,8 @@ func windowsOpen(command, dir string, app *tview.Application) error {
 	// Fallback: suspend TUI and run inline
 	var runErr error
 	app.Suspend(func() {
-		cmd := exec.Command("cmd", "/c", fmt.Sprintf("cd /d \"%s\" && %s", dir, command))
+		cmd := exec.Command("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("Set-Location '%s'; %s", strings.ReplaceAll(dir, "'", "''"), command))
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		runErr = cmd.Run()
 	})
