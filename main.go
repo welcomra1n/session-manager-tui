@@ -145,10 +145,20 @@ func selfUpdate() error {
 	}
 	f.Close()
 
-	// Replace old binary
+	// Replace old binary — move old out first if direct rename fails
 	if err := os.Rename(tmpFile, execPath); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("교체 실패: %v", err)
+		oldBackup := execPath + ".old"
+		os.Remove(oldBackup)
+		if mvErr := os.Rename(execPath, oldBackup); mvErr != nil {
+			os.Remove(tmpFile)
+			return fmt.Errorf("교체 실패: %v (backup: %v)", err, mvErr)
+		}
+		if err2 := os.Rename(tmpFile, execPath); err2 != nil {
+			os.Rename(oldBackup, execPath) // restore
+			os.Remove(tmpFile)
+			return fmt.Errorf("교체 실패: %v", err2)
+		}
+		os.Remove(oldBackup)
 	}
 
 	fmt.Printf("✅ 업데이트 완료: v%s\n", newVer)
