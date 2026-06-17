@@ -1781,10 +1781,19 @@ func findTabbyExe() string {
 func tabbyOpen(command, dir string, app *tview.Application) error {
 	tabbyPath := findTabbyExe()
 	if tabbyPath != "" {
-		args := append([]string{"run"}, strings.Fields(command)...)
-		cmd := exec.Command(tabbyPath, args...)
-		cmd.Dir = dir
-		return cmd.Run()
+		// Open new tab in project directory, then paste the command
+		openCmd := exec.Command(tabbyPath, "open", dir)
+		if err := openCmd.Run(); err != nil {
+			// Fallback: try 'run' with the command directly
+			args := append([]string{"run"}, strings.Fields(command)...)
+			runCmd := exec.Command(tabbyPath, args...)
+			runCmd.Dir = dir
+			return runCmd.Start()
+		}
+		// Brief pause for tab to initialize, then paste command
+		time.Sleep(500 * time.Millisecond)
+		pasteCmd := exec.Command(tabbyPath, "paste", command+"\n")
+		return pasteCmd.Run()
 	}
 	// Tabby exe not found — fallback to inline
 	var runErr error
