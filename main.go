@@ -1837,22 +1837,22 @@ func tabbyOpen(command, dir string, app *tview.Application) error {
 
 func tabbyTypeCommand(command string) error {
 	if runtime.GOOS == "darwin" {
-		script := fmt.Sprintf(`tell application "System Events"
+		script := fmt.Sprintf(`set the clipboard to "%s"
+tell application "System Events"
 	tell process "Tabby"
-		keystroke "%s"
+		keystroke "v" using command down
+		delay 0.1
 		key code 36
 	end tell
 end tell`, escapeAppleScript(command))
 		return exec.Command("osascript", "-e", script).Run()
 	}
 	if runtime.GOOS == "windows" {
-		ps := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; `+
+		ps := fmt.Sprintf(`Set-Clipboard '%s'; `+
+			`Add-Type -AssemblyName System.Windows.Forms; `+
 			`Start-Sleep -Milliseconds 200; `+
-			`[System.Windows.Forms.SendKeys]::SendWait('%s{ENTER}')`,
-			strings.NewReplacer(
-				"+", "{+}", "^", "{^}", "%", "{%%}", "(", "{(}", ")", "{)}",
-				"{", "{{}", "}", "{}}", "-", "{-}",
-			).Replace(command))
+			`[System.Windows.Forms.SendKeys]::SendWait('^v{ENTER}')`,
+			strings.ReplaceAll(command, "'", "''"))
 		return exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
 	}
 	return fmt.Errorf("tabby tab typing not supported on %s", runtime.GOOS)
