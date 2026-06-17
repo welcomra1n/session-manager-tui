@@ -1532,11 +1532,12 @@ const (
 	backendGhostty
 	backendSSH
 	backendWindows
+	backendTabby
 	backendFallback
 )
 
 func (b termBackend) String() string {
-	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "SSH", "Windows", "fallback"}
+	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Ghostty", "SSH", "Windows", "Tabby", "fallback"}
 	if int(b) < len(names) {
 		return names[b]
 	}
@@ -1559,7 +1560,7 @@ func detectBackend() termBackend {
 	case "ghostty":
 		return backendGhostty
 	case "Tabby":
-		return backendFallback
+		return backendTabby
 	}
 	if os.Getenv("KITTY_PID") != "" {
 		return backendKitty
@@ -1605,6 +1606,8 @@ func openInTerminal(command, dir string, inTab bool, app *tview.Application) err
 		return sshOpen(command, dir, inTab, app)
 	case backendWindows:
 		return windowsOpen(command, dir, app)
+	case backendTabby:
+		return tabbyOpen(command, dir, app)
 	default:
 		var runErr error
 		app.Suspend(func() {
@@ -1749,6 +1752,41 @@ func windowsOpen(command, dir string, app *tview.Application) error {
 		return exec.Command("wt.exe", "-w", "0", "new-tab", "--startingDirectory", dir, "cmd", "/c", fullCmd).Run()
 	}
 	// Fallback: suspend TUI and run inline
+	var runErr error
+	app.Suspend(func() {
+		args := strings.Fields(command)
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		runErr = cmd.Run()
+	})
+	return runErr
+}
+
+func findTabbyExe() string {
+	for _, name := range []string{"tabby", "Tabby"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		p := filepath.Join(localAppData, "Programs", "Tabby", "Tabby.exe")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+func tabbyOpen(command, dir string, app *tview.Application) error {
+	tabbyPath := findTabbyExe()
+	if tabbyPath != "" {
+		args := append([]string{"run"}, strings.Fields(command)...)
+		cmd := exec.Command(tabbyPath, args...)
+		cmd.Dir = dir
+		return cmd.Run()
+	}
+	// Tabby exe not found — fallback to inline
 	var runErr error
 	app.Suspend(func() {
 		args := strings.Fields(command)
