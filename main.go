@@ -1794,6 +1794,12 @@ func findTabbyExe() string {
 			}
 		}
 	}
+	if runtime.GOOS == "darwin" {
+		p := "/Applications/Tabby.app/Contents/MacOS/Tabby"
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
 	if runtime.GOOS == "windows" {
 		out, err := exec.Command("powershell", "-NoProfile", "-Command",
 			"(Get-Process Tabby -ErrorAction SilentlyContinue | Select-Object -First 1).Path").Output()
