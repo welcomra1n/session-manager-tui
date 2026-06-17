@@ -1815,21 +1815,15 @@ func findTabbyExe() string {
 func tabbyOpen(command, dir string, app *tview.Application) error {
 	tabbyPath := findTabbyExe()
 	if tabbyPath != "" {
-		// Open new tab in project directory, then paste the command
+		// Open new tab in project directory
 		openCmd := exec.Command(tabbyPath, "open", dir)
-		if err := openCmd.Run(); err != nil {
-			// Fallback: try 'run' with the command directly
-			args := append([]string{"run"}, strings.Fields(command)...)
-			runCmd := exec.Command(tabbyPath, args...)
-			runCmd.Dir = dir
-			return runCmd.Start()
+		if err := openCmd.Run(); err == nil {
+			// Use osascript (macOS) or PowerShell (Windows) to type command
+			time.Sleep(800 * time.Millisecond)
+			return tabbyTypeCommand(command)
 		}
-		// Brief pause for tab to initialize, then paste command
-		time.Sleep(500 * time.Millisecond)
-		pasteCmd := exec.Command(tabbyPath, "paste", command+"\n")
-		return pasteCmd.Run()
 	}
-	// Tabby exe not found — fallback to inline
+	// Fallback to inline
 	var runErr error
 	app.Suspend(func() {
 		args := strings.Fields(command)
@@ -1839,6 +1833,29 @@ func tabbyOpen(command, dir string, app *tview.Application) error {
 		runErr = cmd.Run()
 	})
 	return runErr
+}
+
+func tabbyTypeCommand(command string) error {
+	if runtime.GOOS == "darwin" {
+		script := fmt.Sprintf(`tell application "System Events"
+	tell process "Tabby"
+		keystroke "%s"
+		key code 36
+	end tell
+end tell`, escapeAppleScript(command))
+		return exec.Command("osascript", "-e", script).Run()
+	}
+	if runtime.GOOS == "windows" {
+		ps := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; `+
+			`Start-Sleep -Milliseconds 200; `+
+			`[System.Windows.Forms.SendKeys]::SendWait('%s{ENTER}')`,
+			strings.NewReplacer(
+				"+", "{+}", "^", "{^}", "%", "{%%}", "(", "{(}", ")", "{)}",
+				"{", "{{}", "}", "{}}", "-", "{-}",
+			).Replace(command))
+		return exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
+	}
+	return fmt.Errorf("tabby tab typing not supported on %s", runtime.GOOS)
 }
 
 // ── AI Summary ──────────────────────────────────────────────────────────────
