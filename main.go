@@ -127,10 +127,9 @@ func selfUpdate() error {
 	if err != nil {
 		return fmt.Errorf("실행 파일 경로 확인 실패: %v", err)
 	}
-	// Resolve symlinks
-	execPath, err = filepath.EvalSymlinks(execPath)
-	if err != nil {
-		return fmt.Errorf("심볼릭 링크 해석 실패: %v", err)
+	// Resolve symlinks (ignore error — Windows shims may not resolve)
+	if resolved, err := filepath.EvalSymlinks(execPath); err == nil {
+		execPath = resolved
 	}
 
 	// Write to temp file first
