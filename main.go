@@ -2916,6 +2916,48 @@ func main() {
 	}
 
 	tree.SetSelectedFunc(func(node *tview.TreeNode) {
+		// Multi-select: open all selected sessions
+		var selected []*Session
+		for _, s := range sessions {
+			if s.Selected {
+				selected = append(selected, s)
+			}
+		}
+		if len(selected) > 0 {
+			go func() {
+				opened := 0
+				for _, s := range selected {
+					var resumeCmd string
+					if s.Provider == ProviderCodex {
+						resumeCmd = fmt.Sprintf("codex resume %s --sandbox danger-full-access", s.ID)
+					} else {
+						resumeCmd = fmt.Sprintf("claude --resume %s --dangerously-skip-permissions", s.ID)
+					}
+					dir := s.ProjectDir
+					if _, statErr := os.Stat(dir); statErr != nil {
+						if s.CWD != "" {
+							dir = s.CWD
+						}
+						if _, statErr := os.Stat(dir); statErr != nil {
+							dir, _ = os.UserHomeDir()
+						}
+					}
+					if err := openInTerminal(resumeCmd, dir, true, app); err == nil {
+						opened++
+					}
+					time.Sleep(300 * time.Millisecond)
+				}
+				// Clear selection
+				for i := range sessions {
+					sessions[i].Selected = false
+				}
+				app.QueueUpdateDraw(func() {
+					populateTree(currentFilter)
+					statusBar.SetText(fmt.Sprintf("[green]%d개 세션 열림 (%s)[-]", opened, activeBackend))
+				})
+			}()
+			return
+		}
 		openSessionFromNode(node, true)
 	})
 
