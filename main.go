@@ -1843,6 +1843,8 @@ tell application "System Events"
 		keystroke "v" using command down
 		delay 0.1
 		key code 36
+		delay 0.3
+		key code 48 using {control down, shift down}
 	end tell
 end tell`, escapeAppleScript(command))
 		return exec.Command("osascript", "-e", script).Run()
@@ -1851,7 +1853,9 @@ end tell`, escapeAppleScript(command))
 		ps := fmt.Sprintf(`Set-Clipboard '%s'; `+
 			`Add-Type -AssemblyName System.Windows.Forms; `+
 			`Start-Sleep -Milliseconds 200; `+
-			`[System.Windows.Forms.SendKeys]::SendWait('^v{ENTER}')`,
+			`[System.Windows.Forms.SendKeys]::SendWait('^v{ENTER}'); `+
+			`Start-Sleep -Milliseconds 300; `+
+			`[System.Windows.Forms.SendKeys]::SendWait('^+{TAB}')`,
 			strings.ReplaceAll(command, "'", "''"))
 		return exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
 	}
