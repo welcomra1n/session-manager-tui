@@ -1774,15 +1774,33 @@ func windowsOpen(command, dir string, app *tview.Application) error {
 }
 
 func findTabbyExe() string {
-	for _, name := range []string{"tabby", "Tabby"} {
+	for _, name := range []string{"tabby", "Tabby", "tabby.exe", "Tabby.exe"} {
 		if p, err := exec.LookPath(name); err == nil {
 			return p
 		}
 	}
-	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
-		p := filepath.Join(localAppData, "Programs", "Tabby", "Tabby.exe")
-		if _, err := os.Stat(p); err == nil {
-			return p
+	for _, envVar := range []string{"LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"} {
+		base := os.Getenv(envVar)
+		if base == "" {
+			continue
+		}
+		for _, sub := range []string{
+			filepath.Join("Programs", "Tabby", "Tabby.exe"),
+			filepath.Join("Tabby", "Tabby.exe"),
+		} {
+			p := filepath.Join(base, sub)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("powershell", "-NoProfile", "-Command",
+			"(Get-Process Tabby -ErrorAction SilentlyContinue | Select-Object -First 1).Path").Output()
+		if err == nil {
+			if p := strings.TrimSpace(string(out)); p != "" {
+				return p
+			}
 		}
 	}
 	return ""
