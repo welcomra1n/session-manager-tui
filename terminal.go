@@ -433,8 +433,19 @@ func (tw *TerminalWidget) InputHandler() func(event *tcell.EventKey, setFocus fu
 
 func (tw *TerminalWidget) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
 	return tw.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
-		if action == tview.MouseLeftClick {
+		switch action {
+		case tview.MouseLeftClick:
 			setFocus(tw)
+			return true, nil
+		case tview.MouseScrollUp:
+			if tw.running {
+				tw.writeInput([]byte("\x1b[5~"))
+			}
+			return true, nil
+		case tview.MouseScrollDown:
+			if tw.running {
+				tw.writeInput([]byte("\x1b[6~"))
+			}
 			return true, nil
 		}
 		return false, nil
