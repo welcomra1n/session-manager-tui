@@ -286,8 +286,15 @@ func (tw *TerminalWidget) Draw(screen tcell.Screen) {
 	cols, rows := vt.Size()
 
 	for row := 0; row < h && row < rows; row++ {
-		for col := 0; col < w && col < cols; col++ {
+		col := 0
+		for col < w && col < cols {
 			g := vt.Cell(col, row)
+			ch := g.Char
+			if ch == 0 {
+				screen.SetContent(x+col, y+row, ' ', nil, tcell.StyleDefault)
+				col++
+				continue
+			}
 			style := tcell.StyleDefault.
 				Foreground(vtColorToTcell(g.FG)).
 				Background(vtColorToTcell(g.BG))
@@ -303,11 +310,20 @@ func (tw *TerminalWidget) Draw(screen tcell.Screen) {
 			if g.Mode&vtAttrReverse != 0 {
 				style = style.Reverse(true)
 			}
-			ch := g.Char
-			if ch == 0 {
-				ch = ' '
+			cw := 1
+			if ch >= 0x1100 {
+				if (ch >= 0x1100 && ch <= 0x115F) ||
+					(ch >= 0x2E80 && ch <= 0x9FFF) ||
+					(ch >= 0xAC00 && ch <= 0xD7AF) ||
+					(ch >= 0xF900 && ch <= 0xFAFF) ||
+					(ch >= 0xFE10 && ch <= 0xFE6F) ||
+					(ch >= 0xFF01 && ch <= 0xFF60) ||
+					(ch >= 0xFFE0 && ch <= 0xFFE6) {
+					cw = 2
+				}
 			}
 			screen.SetContent(x+col, y+row, ch, nil, style)
+			col += cw
 		}
 	}
 

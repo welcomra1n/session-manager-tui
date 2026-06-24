@@ -4272,9 +4272,7 @@ func main() {
 						searchInput.SetText(filterText)
 						currentFilter = filterText
 						searching = true
-						leftPane.Clear()
-						leftPane.AddItem(searchInput, 1, 0, false)
-						leftPane.AddItem(tree, 0, 1, false)
+						rebuildLeftPane(true)
 						populateTree(filterText)
 						app.SetFocus(tree)
 						return nil
@@ -4293,9 +4291,7 @@ func main() {
 							searchInput.SetText(filterText)
 							currentFilter = filterText
 							searching = true
-							leftPane.Clear()
-							leftPane.AddItem(searchInput, 1, 0, false)
-							leftPane.AddItem(tree, 0, 1, false)
+							rebuildLeftPane(true)
 							populateTree(filterText)
 							app.SetRoot(mainLayout, true)
 							app.SetFocus(tree)
