@@ -92,8 +92,11 @@ func (tw *TerminalWidget) StartCommand(command, dir string, args ...string) erro
 
 	vt := vt.New(vt.WithSize(tw.cols, tw.rows), vt.WithWriter(p))
 
-	cmdArgs := append([]string{command}, args...)
-	cmd := p.Command(cmdArgs[0], cmdArgs[1:]...)
+	resolved := command
+	if lp, lerr := exec.LookPath(command); lerr == nil {
+		resolved = lp
+	}
+	cmd := p.Command(resolved, args...)
 	cmd.Dir = dir
 	env := os.Environ()
 	hasTerm := false
