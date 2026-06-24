@@ -2128,7 +2128,7 @@ func main() {
 	helpBar := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	helpBar.SetText("[#666666]? 도움말 | Esc 종료[-]")
+	helpBar.SetText("[#666666]? 도움말 | Ctrl+] 터미널⇄사이드바 | Esc 종료[-]")
 
 	statusBar := tview.NewTextView().
 		SetDynamicColors(true).
@@ -2136,23 +2136,44 @@ func main() {
 
 	// ── Layout ──
 
-	leftPane := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(tree, 0, 1, true)
+	termWidget := NewTerminalWidget(app)
 
-	rightPane := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(infoView, 0, 2, false).
-		AddItem(convView, 0, 3, false)
+	previewPane := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(infoView, 0, 1, false).
+		AddItem(convView, 0, 2, false)
+
+	leftPane := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(tree, 0, 2, true).
+		AddItem(previewPane, 0, 1, false)
 
 	mainBody := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(leftPane, 0, 1, true)
+		AddItem(leftPane, 45, 0, true).
+		AddItem(termWidget, 0, 1, false)
 
 	mainLayout := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(mainBody, 0, 1, true).
 		AddItem(helpBar, 1, 0, false).
 		AddItem(statusBar, 1, 0, false)
 
-	previewOpen := false
+	termFocused := false
+
+	focusTerminal := func() {
+		termFocused = true
+		app.SetFocus(termWidget)
+		leftPane.SetBorderColor(tcell.ColorDefault)
+		termWidget.SetBorderColor(tcell.ColorGreen)
+	}
+
+	focusSidebar := func() {
+		termFocused = false
+		app.SetFocus(tree)
+		termWidget.SetBorderColor(tcell.ColorDefault)
+	}
+
+	previewOpen := true
 	var togglePreview func()
+	var rebuildLeftPane func(bool)
+	searching := false
 	currentFilter := ""
 
 	// Sort modes
@@ -2272,13 +2293,9 @@ func main() {
 	}
 
 	togglePreview = func() {
+		previewOpen = !previewOpen
+		rebuildLeftPane(searching)
 		if previewOpen {
-			mainBody.RemoveItem(rightPane)
-			previewOpen = false
-			app.SetFocus(tree)
-		} else {
-			mainBody.AddItem(rightPane, 0, 1, false)
-			previewOpen = true
 			cur := tree.GetCurrentNode()
 			if s := nodeSession(cur); s != nil {
 				showSessionInfo(s)
@@ -2668,39 +2685,20 @@ func main() {
 	// ── Actions ──
 
 	newSessionInDir := func(provider Provider, dir string) {
-		var cmd, label string
+		var cmdName, label string
+		var cmdArgs []string
 		if provider == ProviderCodex {
-			cmd = "codex --sandbox danger-full-access"
+			cmdName = "codex"
+			cmdArgs = []string{"--sandbox", "danger-full-access"}
 			label = "Codex"
 		} else {
-			cmd = "claude --dangerously-skip-permissions"
+			cmdName = "claude"
+			cmdArgs = []string{"--dangerously-skip-permissions"}
 			label = "Claude"
 		}
-		spinFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		stopSpin := make(chan struct{})
-		go func() {
-			i := 0
-			tick := time.NewTicker(80 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-stopSpin:
-					return
-				case <-tick.C:
-					frame := spinFrames[i%len(spinFrames)]
-					app.QueueUpdateDraw(func() {
-						statusBar.SetText(fmt.Sprintf("[yellow]%s 여는 중...[-]", frame))
-					})
-					i++
-				}
-			}
-		}()
-		err := openInTerminal(cmd, dir, true, app)
-		close(stopSpin)
-		if err != nil {
-			statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
-		} else {
-			statusBar.SetText(fmt.Sprintf("[green]새 %s 세션 (%s)[-]", label, lastSegment(dir)))
+		termWidget.SetOnExit(func() {
+			focusSidebar()
+			statusBar.SetText("[yellow]세션 종료됨[-]")
 			go func() {
 				time.Sleep(2 * time.Second)
 				fresh := discoverSessions()
@@ -2711,6 +2709,12 @@ func main() {
 					populateTree(currentFilter)
 				})
 			}()
+		})
+		if err := termWidget.StartCommand(cmdName, dir, cmdArgs...); err != nil {
+			statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
+		} else {
+			statusBar.SetText(fmt.Sprintf("[green]새 %s 세션 (%s)[-]", label, lastSegment(dir)))
+			focusTerminal()
 		}
 	}
 
@@ -2836,36 +2840,13 @@ func main() {
 				dir, _ = os.UserHomeDir()
 			}
 		}
-		spinFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		stopSpin := make(chan struct{})
-		go func() {
-			i := 0
-			tick := time.NewTicker(80 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-stopSpin:
-					return
-				case <-tick.C:
-					frame := spinFrames[i%len(spinFrames)]
-					app.QueueUpdateDraw(func() {
-						statusBar.SetText(fmt.Sprintf("[yellow]%s 여는 중...[-]", frame))
-					})
-					i++
-				}
-			}
-		}()
-		err := openInTerminal(resumeCmd, dir, inTab, app)
-		close(stopSpin)
-		if err != nil {
-			statusBar.SetText(fmt.Sprintf("[red]실패 (%s): %v[-]", activeBackend, err))
-		} else {
-			mode := "tab"
-			if !inTab {
-				mode = "split"
-			}
-			statusBar.SetText(fmt.Sprintf("[green]%s 열림 (%s %s)[-]", esc(s.ProjectName), activeBackend, mode))
-			// Auto-refresh after opening so the resumed session moves to top
+		args := strings.Fields(resumeCmd)
+		if len(args) == 0 {
+			return
+		}
+		termWidget.SetOnExit(func() {
+			focusSidebar()
+			statusBar.SetText("[yellow]세션 종료됨[-]")
 			doRefresh := func() {
 				fresh := discoverSessions()
 				app.QueueUpdateDraw(func() {
@@ -2877,11 +2858,13 @@ func main() {
 			go func() {
 				time.Sleep(2 * time.Second)
 				doRefresh()
-				time.Sleep(5 * time.Second)
-				doRefresh()
-				time.Sleep(10 * time.Second)
-				doRefresh()
 			}()
+		})
+		if err := termWidget.StartCommand(args[0], dir, args[1:]...); err != nil {
+			statusBar.SetText(fmt.Sprintf("[red]실패: %v[-]", err))
+		} else {
+			statusBar.SetText(fmt.Sprintf("[green]%s 열림 (내장 터미널)[-]", esc(s.ProjectName)))
+			focusTerminal()
 		}
 	}
 
@@ -2916,48 +2899,6 @@ func main() {
 	}
 
 	tree.SetSelectedFunc(func(node *tview.TreeNode) {
-		// Multi-select: open all selected sessions
-		var selected []*Session
-		for _, s := range sessions {
-			if s.Selected {
-				selected = append(selected, s)
-			}
-		}
-		if len(selected) > 0 {
-			go func() {
-				opened := 0
-				for _, s := range selected {
-					var resumeCmd string
-					if s.Provider == ProviderCodex {
-						resumeCmd = fmt.Sprintf("codex resume %s --sandbox danger-full-access", s.ID)
-					} else {
-						resumeCmd = fmt.Sprintf("claude --resume %s --dangerously-skip-permissions", s.ID)
-					}
-					dir := s.ProjectDir
-					if _, statErr := os.Stat(dir); statErr != nil {
-						if s.CWD != "" {
-							dir = s.CWD
-						}
-						if _, statErr := os.Stat(dir); statErr != nil {
-							dir, _ = os.UserHomeDir()
-						}
-					}
-					if err := openInTerminal(resumeCmd, dir, true, app); err == nil {
-						opened++
-					}
-					time.Sleep(300 * time.Millisecond)
-				}
-				// Clear selection
-				for i := range sessions {
-					sessions[i].Selected = false
-				}
-				app.QueueUpdateDraw(func() {
-					populateTree(currentFilter)
-					statusBar.SetText(fmt.Sprintf("[green]%d개 세션 열림 (%s)[-]", opened, activeBackend))
-				})
-			}()
-			return
-		}
 		openSessionFromNode(node, true)
 	})
 
@@ -2965,7 +2906,6 @@ func main() {
 
 	focusables := []tview.Primitive{tree, convView}
 	focusIdx := 0
-	searching := false
 
 	updateBorders := func() {
 		if focusIdx == 0 {
@@ -2977,18 +2917,28 @@ func main() {
 		}
 	}
 
+	rebuildLeftPane = func(withSearch bool) {
+		leftPane.Clear()
+		if withSearch {
+			leftPane.AddItem(searchInput, 1, 0, false)
+			leftPane.AddItem(tree, 0, 2, false)
+		} else {
+			leftPane.AddItem(tree, 0, 2, true)
+		}
+		if previewOpen {
+			leftPane.AddItem(previewPane, 0, 1, false)
+		}
+	}
+
 	showSearch := func() {
 		searching = true
-		leftPane.Clear()
-		leftPane.AddItem(searchInput, 1, 0, false)
-		leftPane.AddItem(tree, 0, 1, false)
+		rebuildLeftPane(true)
 		app.SetFocus(searchInput)
 	}
 
 	hideSearch := func() {
 		searching = false
-		leftPane.Clear()
-		leftPane.AddItem(tree, 0, 1, true)
+		rebuildLeftPane(false)
 		searchInput.SetText("")
 		currentFilter = ""
 		populateTree("")
@@ -3015,6 +2965,21 @@ func main() {
 	// ── Key bindings ──
 
 	app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		// Ctrl+] — toggle focus between sidebar and terminal
+		if ev.Key() == tcell.KeyCtrlRightSq {
+			if termFocused {
+				focusSidebar()
+			} else if termWidget.IsRunning() {
+				focusTerminal()
+			}
+			return nil
+		}
+
+		// When terminal focused, forward everything except Ctrl+]
+		if termFocused {
+			return ev
+		}
+
 		// Skip key mapping when in input field or modal
 		focused := app.GetFocus()
 		if _, ok := focused.(*tview.InputField); ok {
